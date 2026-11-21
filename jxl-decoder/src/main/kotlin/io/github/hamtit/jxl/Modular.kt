@@ -330,21 +330,17 @@ internal class WeightedPredictor(private val width: Int, private val wp: WpParam
     private var sp1 = 0L
     private var sp2 = 0L
     private var sp3 = 0L
-    private val maxW0 = wp.w0.toLong()
-    private val maxW1 = wp.w1.toLong()
-    private val maxW2 = wp.w2.toLong()
-    private val maxW3 = wp.w3.toLong()
+    private val weights0 = SMALL_WEIGHTS[wp.w0]
+    private val weights1 = SMALL_WEIGHTS[wp.w1]
+    private val weights2 = SMALL_WEIGHTS[wp.w2]
+    private val weights3 = SMALL_WEIGHTS[wp.w3]
     var prediction = 0L
         private set
     var maxError = 0
         private set
 
-    private fun weightOf(a: Int, b: Int, c: Int, maxW: Long): Long {
-        val e = ((a.toLong() and 0xffffffffL) + (b.toLong() and 0xffffffffL) + (c.toLong() and 0xffffffffL)) and 0xffffffffL
-        val t = (e + 1) shr 5
-        val shift = if (t == 0L) 0 else 63 - java.lang.Long.numberOfLeadingZeros(t)
-        return 4 + ((maxW * DIV_LOOKUP[((e shr shift) + 1).toInt()]) shr shift)
-    }
+    private fun weightOf(error: Int, weights: IntArray, maxW: Int): Int =
+        if (error >= 0 && error < SMALL_ERROR_LIMIT) weights[error] else computeWeight(error, maxW)
 
     fun predict(n: Int, nw: Int, ne: Int, w: Int, nn: Int) {
         val tw = teW.toLong()
@@ -365,16 +361,17 @@ internal class WeightedPredictor(private val width: Int, private val wp: WpParam
         sp2 = s2
         sp3 = s3
 
-        val w0 = weightOf(nwww0, nw0, ne0, maxW0)
-        val w1 = weightOf(nwww1, nw1, ne1, maxW1)
-        val w2 = weightOf(nwww2, nw2, ne2, maxW2)
-        val w3 = weightOf(nwww3, nw3, ne3, maxW3)
-        val logWeight = 63 - java.lang.Long.numberOfLeadingZeros((w0 + w1 + w2 + w3) shr 4)
-        // 重みは Int に切り詰めてから (元の実装と同じ) 右シフトする
-        val v0 = w0.toInt() ushr logWeight
-        val v1 = w1.toInt() ushr logWeight
-        val v2 = w2.toInt() ushr logWeight
-        val v3 = w3.toInt() ushr logWeight
+        // 誤差は unsigned 32-bit の和。Int の加算も同じく 2^32 で折り返す
+        val w0 = weightOf(nwww0 + nw0 + ne0, weights0, wp.w0)
+        val w1 = weightOf(nwww1 + nw1 + ne1, weights1, wp.w1)
+        val w2 = weightOf(nwww2 + nw2 + ne2, weights2, wp.w2)
+        val w3 = weightOf(nwww3 + nw3 + ne3, weights3, wp.w3)
+        // 最大重みは 15 * 2^24 + 4 なので、4 つの和も Int に収まる
+        val logWeight = 31 - Integer.numberOfLeadingZeros((w0 + w1 + w2 + w3) ushr 4)
+        val v0 = w0 ushr logWeight
+        val v1 = w1 ushr logWeight
+        val v2 = w2 ushr logWeight
+        val v3 = w3 ushr logWeight
         val sumW2 = v0 + v1 + v2 + v3
         val sum = (sumW2.toLong() shr 1) - 1 + s0 * v0 + s1 * v1 + s2 * v2 + s3 * v3
         var pred = (sum * DIV_LOOKUP[sumW2]) shr 24
@@ -440,6 +437,16 @@ internal class WeightedPredictor(private val width: Int, private val wp: WpParam
 
     companion object {
         val DIV_LOOKUP = LongArray(65).also { for (i in 1..64) it[i] = ((1 shl 24) / i).toLong() }
+        private const val SMALL_ERROR_LIMIT = 128
+        // 頻出する小さな誤差の重みを、4 ビットの maxW ごとに全チャンネルで共有する
+        private val SMALL_WEIGHTS = Array(16) { w -> IntArray(SMALL_ERROR_LIMIT) { e -> computeWeight(e, w) } }
+
+        private fun computeWeight(error: Int, maxW: Int): Int {
+            val ePlusOne = (error.toLong() and 0xffffffffL) + 1
+            // floor(log2((e + 1) >> 5)) を 0 以上に切り詰める。e + 1 は 2^32 まで取り得る
+            val shift = maxOf(0, 58 - java.lang.Long.numberOfLeadingZeros(ePlusOne))
+            return 4 + ((maxW * DIV_LOOKUP[(error ushr shift) + 1].toInt()) ushr shift)
+        }
     }
 }
 

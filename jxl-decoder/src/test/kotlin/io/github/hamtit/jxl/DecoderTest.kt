@@ -11,7 +11,7 @@ import kotlin.test.fail
 
 /**
  * fixtures の各 .jxl を復号し、libjxl (djxl) で 8 ビットに復号した fixtures/<名前>.<フレーム番号>.png と比べる。
- * 非可逆は丸めの違いで ±1 まで、可逆 (lossless_*, *_q100) は完全一致を求める。
+ * 非可逆は丸めの違いで ±1 まで、可逆 (lossless_*, anim_lossless, *_q100) は完全一致を求める。
  */
 class DecoderTest {
     private val dir = File(javaClass.getResource("/fixtures")!!.toURI())
@@ -21,7 +21,7 @@ class DecoderTest {
     private fun compare(name: String, threads: Int) {
         val data = File(dir, "$name.jxl").readBytes()
         val decoder = JxlDecoder(data, JxlDecodeOptions(threads = threads))
-        val lossless = name.startsWith("lossless") || name.endsWith("q100")
+        val lossless = name.startsWith("lossless") || name == "anim_lossless" || name.endsWith("q100")
         var index = 0
         while (true) {
             val frame = decoder.nextFrame() ?: break
@@ -102,6 +102,13 @@ class DecoderTest {
             for (i in frames.indices) {
                 assertTrue(frames[i].pixels.contentEquals(snapshots[i]), "$name frame $i changed")
                 assertTrue(again[i].pixels.contentEquals(snapshots[i]), "$name frame $i after rewind")
+            }
+            // 出力配列を呼び出し元が変更しても、後続フレームの参照は書き換わらない
+            decoder.rewind()
+            for ((i, expected) in snapshots.withIndex()) {
+                val pixels = decoder.nextFrame()!!.pixels
+                assertTrue(pixels.contentEquals(expected), "$name frame $i after editing output")
+                pixels.fill(0x12345678)
             }
         }
     }
