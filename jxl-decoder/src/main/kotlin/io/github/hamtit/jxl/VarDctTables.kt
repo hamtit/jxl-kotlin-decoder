@@ -324,7 +324,6 @@ internal class QuantMatrices(
                     }
                     r
                 }
-                else -> error("unreachable")
             }
             for (wa in weights) {
                 for (i in wa.indices) {

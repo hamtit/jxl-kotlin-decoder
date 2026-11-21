@@ -95,7 +95,17 @@ cli/build/install/cli/bin/cli compare in.jxl ref.png   # PSNR と最大誤差
 
 環境変数 `JXL_TIMING=1` を付けると、フレームごとの処理時間の内訳を標準エラーに出します。
 
+### バージョンとリリース
+
+バージョンは `gradle.properties` の `version` だけで決まります。上げて `main` にマージすると、CI (`.github/workflows/ci.yml`) が `v<version>` のタグと GitHub のリリース (jar・ソースの jar・SHA256SUMS) を作ります。JitPack はそのタグから配ります。同じバージョンのタグを手で push しても同じようにリリースされます (タグと `gradle.properties` が食い違うと失敗します)。
+
+CI は PR と `main` への push のたびに、警告をエラーにしたコンパイル、Linux x64・arm64 でのビルドとテスト、jar の中身 (ライセンス・Java 17 のクラス) と jar での復号の確認を行います。
+
 ## 謝辞
 
 - [libjxl](https://github.com/libjxl/libjxl) (BSD-3-Clause, Copyright (c) the JPEG XL Project Authors): 仕様の参照、定数・表 (量子化行列、AFV の基底、アップサンプリングの重み、sRGB の近似式など)
 - [jxl-oxide](https://github.com/tirr-c/jxl-oxide) (MIT OR Apache-2.0, Copyright (c) Wonwoo Choi): デコード処理の構成と各処理の実装の参考
+
+## ライセンス
+
+BSD-3-Clause ([LICENSE](LICENSE))。jxl-oxide を元にした部分の MIT ライセンスの表示は [LICENSE-jxl-oxide](LICENSE-jxl-oxide) にあります。どちらも jar の `META-INF` に入っています。

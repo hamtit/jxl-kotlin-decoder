@@ -4,13 +4,12 @@ plugins {
     `maven-publish`
 }
 
-group = "io.github.hamtit"
-version = "0.1.0"
-
 kotlin {
     // Android 12 (API 31) 以降の ART でも動くように Java 17 のバイトコードにする
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        // CI の lint では -Pwerror を付けて警告をエラーにする
+        allWarningsAsErrors.set(providers.gradleProperty("werror").isPresent)
     }
     explicitApi()
 }
@@ -23,6 +22,11 @@ java {
 
 dependencies {
     testImplementation(kotlin("test"))
+}
+
+// ライセンスを jar (クラスとソースの両方) に入れる
+tasks.withType<Jar>().configureEach {
+    from(rootProject.files("LICENSE", "LICENSE-jxl-oxide")) { into("META-INF") }
 }
 
 tasks.test {

@@ -1,0 +1,200 @@
+name: CI
+
+# PRs and pushes compile with warnings as errors and build/test on Linux x64 and arm64, then verify the jars.
+# Merging a version bump (gradle.properties) to main creates v<version> and a GitHub release.
+# Pushing a matching tag is also supported. JitPack builds the library from that tag; nothing else is published.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  config:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.config.outputs.version }}
+      tag: ${{ steps.config.outputs.tag }}
+      release: ${{ steps.config.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: config
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version="$(python3 - <<'PY'
+          import re
+
+          props = {}
+          with open("gradle.properties", encoding="utf-8") as f:
+              for line in f:
+                  line = line.strip()
+                  if line and not line.startswith("#") and "=" in line:
+                      key, value = line.split("=", 1)
+                      props[key.strip()] = value.strip()
+          version = props.get("version", "")
+          if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?", version):
+              raise SystemExit(f"Invalid release version in gradle.properties: {version!r}")
+          print(version)
+          PY
+          )"
+          tag="v${version}"
+          release=false
+          if [[ "$REF_TYPE" == tag ]]; then
+            if [[ "$REF_NAME" != "$tag" ]]; then
+              echo "::error::tag $REF_NAME does not match gradle.properties (expected $tag)"
+              exit 1
+            fi
+            release=true
+          elif [[ "$EVENT" == push && "$REF_NAME" == main ]]; then
+            if gh api "repos/$GH_REPO/git/ref/tags/$tag" > /dev/null 2> tag-error.log; then
+              echo "$tag already exists; not releasing"
+            elif grep -q '(HTTP 404)' tag-error.log; then
+              release=true
+            else
+              cat tag-error.log >&2
+              exit 1
+            fi
+          fi
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "release=$release"
+          } >> "$GITHUB_OUTPUT"
+
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Compile with warnings as errors
+        run: ./gradlew --no-daemon -Pwerror compileKotlin compileTestKotlin
+
+  build:
+    needs: config
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build library and CLI
+        run: ./gradlew --no-daemon :jxl-decoder:assemble :cli:installDist
+      - name: Tests (comparison with libjxl output)
+        run: ./gradlew --no-daemon test
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-${{ matrix.runner }}
+          path: jxl-decoder/build/reports/tests
+
+  package:
+    needs: [config, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build and verify jars
+        env:
+          VERSION: ${{ needs.config.outputs.version }}
+        run: |
+          ./gradlew --no-daemon :jxl-decoder:jar :jxl-decoder:sourcesJar :cli:installDist
+          mkdir -p dist work
+          cp "jxl-decoder/build/libs/jxl-decoder-${VERSION}.jar" "jxl-decoder/build/libs/jxl-decoder-${VERSION}-sources.jar" dist/
+          for jar in dist/*.jar; do
+            unzip -l "$jar"
+            unzip -l "$jar" | grep -q 'META-INF/LICENSE$'
+            unzip -l "$jar" | grep -q 'META-INF/LICENSE-jxl-oxide$'
+          done
+          unzip -l "dist/jxl-decoder-${VERSION}-sources.jar" | grep -q 'io/github/hamtit/jxl/JxlDecoder.kt'
+          # Java 17 (class file 61) so that it also runs on Android 12+
+          unzip -q "dist/jxl-decoder-${VERSION}.jar" -d work
+          javap -v work/io/github/hamtit/jxl/JxlDecoder.class | grep -q 'major version: 61'
+          # Decode with the packaged jar and compare with libjxl's output (lossless: must match exactly)
+          ls cli/build/install/cli/lib/jxl-decoder-${VERSION}.jar
+          fixtures=jxl-decoder/src/test/resources/fixtures
+          cli/build/install/cli/bin/cli compare "$fixtures/lossless_e7.jxl" "$fixtures/lossless_e7.0.png" | tee compare.log
+          grep -q 'max error 0$' compare.log
+          (cd dist && sha256sum *.jar > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: dist
+          if-no-files-found: error
+
+  release:
+    if: needs.config.outputs.release == 'true'
+    needs: [config, lint, package]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.config.outputs.tag }}
+          VERSION: ${{ needs.config.outputs.version }}
+        run: |
+          cat > notes.md <<EOF
+          Pure-Kotlin JPEG XL decoder for Android and the JVM (no native code).
+
+          - \`jxl-decoder-${VERSION}.jar\`: the library (Java 17 bytecode, depends only on the Kotlin standard library).
+          - \`jxl-decoder-${VERSION}-sources.jar\`: sources.
+          - \`SHA256SUMS\`: SHA-256 checksums of the jars.
+
+          Gradle: \`implementation("com.github.hamtit.jxl-kotlin-decoder:jxl-decoder:${TAG}")\` with \`maven("https://jitpack.io")\`.
+
+          Built and tested on Linux x64 and arm64, including comparisons with libjxl's output.
+          The packaged jar is also used to decode a lossless image, which must match libjxl exactly.
+          EOF
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            target=(--verify-tag)
+          else
+            target=(--target "$GITHUB_SHA")
+          fi
+          gh release create "$TAG" "${target[@]}" \
+            --title "jxl-decoder ${VERSION}" --notes-file notes.md \
+            dist/*.jar dist/SHA256SUMS
