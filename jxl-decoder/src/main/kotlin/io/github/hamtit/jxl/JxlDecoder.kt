@@ -236,20 +236,34 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
 
     /**
      * index 番目のフレームが参照 [slot] に保存する内容を、後のフレームが置き換えで重ねる元としてだけ使うか
-     * (同じ場所に次の参照が保存されるまで)。ヘッダーを読めなかったフレームがあれば false
+     * (同じ場所に次の参照が保存されるまで)。ヘッダーを読めなかったフレームがあれば false。
+     * 一部を置き換えたフレームが結果を参照として保存すると、置き換えなかった部分の画素はその参照に受け継がれるので、
+     * その参照も ARGB で足りるか (保存先が同じ番号なら続けて、別の番号なら [depth] を増やして) 確かめる
      */
-    private fun argbRefSuffices(index: Int, slot: Int): Boolean {
+    private fun argbRefSuffices(index: Int, slot: Int, depth: Int = 0): Boolean {
+        // 別の番号へ受け継がれる連鎖が長ければ、浮動小数点で持つ (正しさは変わらない)
+        if (depth > 8) return false
         var j = index + 1
         while (true) {
+            val fi = j
             val f = headerAt(j) ?: return false
             if ((scannedPatchSlots[j++] shr slot) and 1 != 0) return false
+            var inherits = false
             // キャンバス全体を置き換えるフレームは重ねる元を見ない
             if (f.isNormalFrame && !(coversCanvas(f) && replacesOnly(f)) &&
                 (f.blending.source == slot || f.ecBlending.any { it.source == slot })
             ) {
                 if (!replacesOnly(f) || f.blending.source != slot || f.ecBlending.any { it.source != slot }) return false
+                // 色変換前に保存する参照はこのフレーム自身だけで、元の画素を受け継がない
+                if (f.canReference && !f.saveBeforeCt) {
+                    if (f.saveAsReference == slot) {
+                        inherits = true
+                    } else if (!argbRefSuffices(fi, f.saveAsReference, depth + 1)) {
+                        return false
+                    }
+                }
             }
-            if (f.canReference && f.saveAsReference == slot) return true
+            if (f.canReference && f.saveAsReference == slot && !inherits) return true
             if (f.isLast) return true
         }
     }
