@@ -243,6 +243,22 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
     private fun argbRefSuffices(index: Int, slot: Int, depth: Int = 0): Boolean {
         // 別の番号へ受け継がれる連鎖が長ければ、浮動小数点で持つ (正しさは変わらない)
         if (depth > 8) return false
+        argbRefMemo[memoKey(index, slot)]?.let { return it }
+        // 同じ番号に受け継いだフレーム。結果はここから先を調べた結果と同じなので、まとめて覚える
+        val passed = ArrayList<Int>()
+        val result = scanArgbRef(index, slot, depth, passed)
+        argbRefMemo[memoKey(index, slot)] = result
+        for (k in passed) argbRefMemo[memoKey(k, slot)] = result
+        return result
+    }
+
+    // argbRefSuffices の結果 (フレームの番号と参照の番号ごと)。同じ参照を受け継ぎ続ける長いアニメーションで、
+    // フレームごとに最後まで調べ直さないようにする
+    private val argbRefMemo = HashMap<Long, Boolean>()
+
+    private fun memoKey(index: Int, slot: Int) = (index.toLong() shl 2) or slot.toLong()
+
+    private fun scanArgbRef(index: Int, slot: Int, depth: Int, passed: ArrayList<Int>): Boolean {
         var j = index + 1
         while (true) {
             val fi = j
@@ -257,6 +273,9 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
                 // 色変換前に保存する参照はこのフレーム自身だけで、元の画素を受け継がない
                 if (f.canReference && !f.saveBeforeCt) {
                     if (f.saveAsReference == slot) {
+                        // ここから先は調べてあれば、その結果を使う
+                        argbRefMemo[memoKey(fi, slot)]?.let { return it }
+                        passed.add(fi)
                         inherits = true
                     } else if (!argbRefSuffices(fi, f.saveAsReference, depth + 1)) {
                         return false
