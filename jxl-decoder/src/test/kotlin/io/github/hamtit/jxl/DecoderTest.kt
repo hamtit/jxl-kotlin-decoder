@@ -118,4 +118,37 @@ class DecoderTest {
             }
         }
     }
+
+    @Test
+    fun skipBitsAdvancesAndRejectsSkipsPastTheEnd() {
+        val data = ByteArray(64) { (it * 37 + 11).toByte() }
+        for (n in listOf(0L, 3L, 13L, 63L, 64L, 100L, 301L)) {
+            val skipped = BitReader(data).apply { readBits(5); skipBits(n) }
+            val read = BitReader(data).apply { readBits(5) }
+            var left = n
+            while (left > 0) {
+                val k = minOf(left, 16L).toInt()
+                read.readBits(k)
+                left -= k
+            }
+            assertEquals(read.readBits(16), skipped.readBits(16), "skip $n")
+        }
+        // 入力より長い読み飛ばし (壊れた拡張データ) は、ループで回さずにすぐ失敗する
+        assertFailsWith<JxlException> { BitReader(data).skipBits(1L shl 60) }
+        assertFailsWith<JxlException> { BitReader(data).skipBits(64L * 8 + 1) }
+    }
+
+    @Test
+    fun floatSamplesIncludingSubnormals() {
+        val f16 = BitDepth(16, 5)
+        assertEquals(1.0f, f16.parseFloatSample(0x3c00))
+        assertEquals(-2.0f, f16.parseFloatSample(0xc000))
+        assertEquals(Math.scalb(1f, -24), f16.parseFloatSample(0x0001))
+        assertEquals(Math.scalb(1023f, -24), f16.parseFloatSample(0x03ff))
+        assertEquals(-0.0f, f16.parseFloatSample(0x8000))
+        val f32 = BitDepth(32, 8)
+        for (v in listOf(1.5f, -3.25f, Float.MIN_VALUE, 1e-40f, -1e-39f)) {
+            assertEquals(v, f32.parseFloatSample(v.toRawBits()))
+        }
+    }
 }

@@ -21,15 +21,16 @@ private fun usage(): Nothing {
     exitProcess(2)
 }
 
-private fun options(args: List<String>): JxlDecodeOptions {
-    val i = args.indexOf("--threads")
-    val threads = if (i >= 0) args[i + 1].toInt() else Runtime.getRuntime().availableProcessors()
-    return JxlDecodeOptions(threads = threads)
-}
+private fun options(args: List<String>): JxlDecodeOptions =
+    JxlDecodeOptions(threads = intOpt(args, "--threads", Runtime.getRuntime().availableProcessors()))
 
+/** 数値のオプション。値が無い・数でない・1 未満なら使い方を表示して終わる */
 private fun intOpt(args: List<String>, name: String, def: Int): Int {
     val i = args.indexOf(name)
-    return if (i >= 0) args[i + 1].toInt() else def
+    if (i < 0) return def
+    val v = args.getOrNull(i + 1)?.toIntOrNull() ?: usage()
+    if (v < 1) usage()
+    return v
 }
 
 private fun positional(args: List<String>): List<String> {
@@ -93,7 +94,10 @@ public fun main(argv: Array<String>) {
         "compare" -> {
             if (pos.size < 2) usage()
             val frame = JxlDecoder.decode(File(pos[0]).readBytes(), options(args))
-            val ref = ImageIO.read(File(pos[1]))
+            val ref = ImageIO.read(File(pos[1])) ?: run {
+                System.err.println("読めない画像形式: ${pos[1]}")
+                exitProcess(1)
+            }
             if (ref.width != frame.width || ref.height != frame.height) {
                 println("size mismatch: ${frame.width}x${frame.height} vs ${ref.width}x${ref.height}")
                 exitProcess(1)

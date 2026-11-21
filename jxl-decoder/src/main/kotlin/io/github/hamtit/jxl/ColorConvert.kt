@@ -48,8 +48,6 @@ internal object ColorConvert {
         val its = 255f / image.toneMapping.intensityTarget
         val m = image.opsinInverseMatrix
         val target = image.colourEncoding
-        val linearOut = !target.wantIcc && target.colourSpace != ColourSpace.XYB &&
-            target.transferFunction == TransferFunction.LINEAR && target.isSrgbPrimaries
         val grey = !target.wantIcc && target.colourSpace == ColourSpace.GREY
         val n = x.size
         parallelRows(executor, img.height) { y0, y1 ->
@@ -67,13 +65,10 @@ internal object ColorConvert {
                     val l = 0.2126f * r + 0.7152f * g + 0.0722f * bb
                     r = l; g = l; bb = l
                 }
-                if (linearOut) {
-                    x[i] = r; y[i] = g; b[i] = bb
-                } else {
-                    x[i] = srgbEncodeFast(r)
-                    y[i] = srgbEncodeFast(g)
-                    b[i] = srgbEncodeFast(bb)
-                }
+                // 出力は常に 8 ビット sRGB なので、画像の色空間が線形でも sRGB の伝達関数をかける
+                x[i] = srgbEncodeFast(r)
+                y[i] = srgbEncodeFast(g)
+                b[i] = srgbEncodeFast(bb)
             }
         }
     }

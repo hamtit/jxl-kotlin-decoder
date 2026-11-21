@@ -121,13 +121,19 @@ internal class BitReader(private val data: ByteArray, private val start: Int, pr
         }
     }
 
+    /** n ビット読み飛ばす。残りより長ければ (壊れたデータ) 読まずに失敗する */
     fun skipBits(n: Long) {
-        var left = n
-        while (left > 0) {
-            val k = if (left > 32) 32 else left.toInt()
-            readBits(k)
-            left -= k
+        if (n < 0 || n > totalBits - bitsRead) fail("unexpected end of bitstream")
+        if (n <= bits) {
+            consume(n.toInt())
+            return
         }
+        // バッファにあるビットを捨て、残りはバイト単位で位置を進める
+        val left = n - bits
+        buf = 0L
+        bits = 0
+        pos += (left / 8).toInt()
+        readBits((left % 8).toInt())
     }
 
     fun checkOverrun() {
@@ -147,7 +153,12 @@ internal class BitReader(private val data: ByteArray, private val start: Int, pr
         var bitsLeft = ext
         var i = 0
         while (bitsLeft != 0L && i < 64) {
-            if (bitsLeft and 1L != 0L) sum += readU64()
+            if (bitsLeft and 1L != 0L) {
+                // 長さは入力の残りを越えられない (越えるなら壊れている)。合計の桁あふれもここで防ぐ
+                val len = readU64()
+                if (len < 0 || len > totalBits) fail("invalid extension length")
+                sum += len
+            }
             bitsLeft = bitsLeft ushr 1
             i++
         }

@@ -13,8 +13,13 @@ internal class BitDepth(val bitsPerSample: Int, val expBits: Int) {
         val signed = sample and (1 shl (bitsPerSample - 1)) != 0
         var mantissa = sample and mantissaMask
         var exp = (sample and expMask) ushr mantissaBits
-        if (exp == 0 && mantissa == 0) return if (signed) -0.0f else 0.0f
-        exp -= (1 shl (expBits - 1)) - 1
+        val bias = (1 shl (expBits - 1)) - 1
+        if (exp == 0) {
+            // 非正規化数 (0 を含む): mantissa × 2^(1 - bias - mantissaBits)
+            val magnitude = Math.scalb(mantissa.toFloat(), 1 - bias - mantissaBits)
+            return if (signed) -magnitude else magnitude
+        }
+        exp -= bias
         mantissa = if (mantissaBits < 23) mantissa shl (23 - mantissaBits) else mantissa ushr (mantissaBits - 23)
         val bits = ((if (signed) 1 else 0) shl 31) or ((exp + 127) shl 23) or mantissa
         return Float.fromBits(bits)

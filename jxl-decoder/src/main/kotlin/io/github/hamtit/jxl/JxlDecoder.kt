@@ -132,6 +132,8 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         if (pos >= codestream.size) fail("unexpected end of codestream")
         val br = BitReader(codestream, pos, codestream.size)
         val fh = FrameHeader.parse(br, header)
+        // 切り出したフレームは画像と別に大きさを持つので、それも上限を確かめる
+        if (fh.width.toLong() * fh.height > minOf(options.maxPixels, Int.MAX_VALUE.toLong())) fail("frame too large")
         val toc = Toc.parse(br, fh)
         val end = toc.end
         if (end > codestream.size) fail("truncated frame")
