@@ -4,10 +4,23 @@ package io.github.hamtit.jxl
 internal class Channel(var width: Int, var height: Int, var hshift: Int, var vshift: Int) {
     var data: IntArray = IntArray(0)
 
+    /** (x, y) のサンプルは data[offset + y * stride + x]。allocate した配列は offset 0・stride = width */
+    var offset = 0
+    var stride = 0
+
     fun allocate() {
         val n = width.toLong() * height
         if (n > Int.MAX_VALUE) fail("channel too large")
         data = IntArray(n.toInt())
+        offset = 0
+        stride = width
+    }
+
+    /** 別の (大きな) 配列の矩形を直接使う */
+    fun bind(data: IntArray, offset: Int, stride: Int) {
+        this.data = data
+        this.offset = offset
+        this.stride = stride
     }
 
     fun copyMeta(): Channel = Channel(width, height, hshift, vshift)
@@ -62,7 +75,93 @@ internal class MaTree(
 ) {
     val size: Int get() = property.size
 
+    /** 自己補正予測器を使うか (プロパティ 15 か、葉の予測器) */
+    val usesWp: Boolean
+
+    /** 参照する前のチャンネルの数 (プロパティ 16 以上) */
+    val maxPrev: Int
+
+    init {
+        var wp = false
+        var mp = 0
+        for (i in property.indices) {
+            val p = property[i]
+            if (p == 15) wp = true
+            if (p >= 16) mp = maxOf(mp, (p - 16) / 4 + 1)
+            if (p < 0 && predictor[i] == Predictor.WEIGHTED) wp = true
+        }
+        usesWp = wp
+        maxPrev = mp
+    }
+
+    /** 全ての分岐が同じプロパティ [property] を見る木の、値 → 葉の表。値は [min]..[max] に切り詰めてから引く */
+    class SinglePropertyLut(val property: Int, val min: Int, val max: Int, val leaf: IntArray)
+
+    /** 分岐が 1 種類のプロパティ (2〜15) だけで、値の範囲が狭い木なら表を作る ([specialize] した木で使う) */
+    val singlePropertyLut: SinglePropertyLut? by lazy(LazyThreadSafetyMode.PUBLICATION) { buildLut() }
+
+    private fun buildLut(): SinglePropertyLut? {
+        if (size == 1) return null
+        var p = -1
+        var lo = Int.MAX_VALUE
+        var hi = Int.MIN_VALUE
+        for (i in 0 until size) {
+            val q = property[i]
+            if (q < 0) continue
+            if (q < 2 || q > 15) return null
+            if (p < 0) p = q else if (p != q) return null
+            lo = minOf(lo, splitValue[i])
+            hi = maxOf(hi, splitValue[i])
+        }
+        // 最大の分割値より大きい値は全て同じ葉になる。Int.MAX_VALUE での分割は左に行く値が無いので、上端はそこで止める
+        val max = minOf(hi.toLong() + 1, Int.MAX_VALUE.toLong()).toInt()
+        if (max.toLong() - lo >= LUT_LIMIT) return null
+        val leaf = IntArray(max - lo + 1)
+        // 木を 1 回だけたどり、各ノードに届く値の区間 [a, b] (表の添字) を子に分けて、葉の区間を埋める。
+        // 区間が空になった枝は打ち切るので、手間はノード数 + 表の大きさで済む
+        val stack = IntArrayList()
+        stack.add(0); stack.add(0); stack.add(leaf.size - 1)
+        var visits = 0
+        while (stack.size > 0) {
+            val b = stack.pop()
+            val a = stack.pop()
+            val node = stack.pop()
+            if (++visits > size) return null // 木でない (同じノードに何度も届く) なら使わない
+            if (property[node] < 0) {
+                java.util.Arrays.fill(leaf, a, b + 1, node)
+                continue
+            }
+            // v > split (添字 k > split - lo) なら左
+            val s = splitValue[node].toLong() - lo
+            val leftA = maxOf(a.toLong(), s + 1)
+            val rightB = minOf(b.toLong(), s)
+            if (leftA <= b) { stack.add(left[node]); stack.add(leftA.toInt()); stack.add(b) }
+            if (a <= rightB) { stack.add(right[node]); stack.add(a); stack.add(rightB.toInt()) }
+        }
+        return SinglePropertyLut(p, lo, max, leaf)
+    }
+
+    /** チャンネル番号・ストリーム番号で分岐するノード */
+    private val chanStreamNodes: IntArray by lazy(LazyThreadSafetyMode.PUBLICATION) {
+        val l = IntArrayList()
+        for (i in 0 until size) if (property[i] == 0 || property[i] == 1) l.add(i)
+        l.toArray()
+    }
+
+    /** [specialize] の結果。チャンネル・ストリームでの分岐の結果が同じなら同じ木になる */
+    private val specialized = java.util.concurrent.ConcurrentHashMap<BranchKey, MaTree>()
+
+    private class BranchKey(val bits: LongArray) {
+        private val hash = bits.contentHashCode()
+        override fun hashCode() = hash
+        override fun equals(other: Any?) = other is BranchKey && other.bits.contentEquals(bits)
+    }
+
     companion object {
+        private const val LUT_LIMIT = 1L shl 14
+        /** 木 1 本あたり、使い回すために残す畳み込んだ木の合計 (Int で 2M 個 = 8 MB) */
+        private const val SPECIALIZED_CACHE_INTS = 1L shl 21
+
         fun parse(br: BitReader, nodeLimit: Int): MaTree {
             val treeCode = EntropyCode.parse(br, 6)
             val reader = treeCode.newReader()
@@ -109,8 +208,32 @@ internal class MaTree(
         }
     }
 
-    /** チャンネル番号とストリーム番号で決まる分岐を畳み込んだ木を作る */
+    /** チャンネル番号とストリーム番号で決まる分岐を畳み込んだ木を作る (分岐の結果が同じなら作った木を使い回す) */
     fun specialize(channel: Int, stream: Int): MaTree {
+        val nodes = chanStreamNodes
+        val bits = LongArray((nodes.size + 63) ushr 6)
+        for (k in nodes.indices) {
+            val n = nodes[k]
+            val v = if (property[n] == 0) channel else stream
+            if (v > splitValue[n]) bits[k ushr 6] = bits[k ushr 6] or (1L shl k)
+        }
+        val key = BranchKey(bits)
+        specialized[key]?.let { return it }
+        val t = specializeUncached(channel, stream)
+        // 持ち続ける量 (ノードの配列 8 本・表・キー) の合計を上限内に収める。入らなければ使い捨てにする
+        val cost = t.size.toLong() * 8 + (t.singlePropertyLut?.leaf?.size ?: 0) + bits.size * 2L
+        if (specializedBudget.addAndGet(-cost) >= 0) {
+            if (specialized.putIfAbsent(key, t) != null) specializedBudget.addAndGet(cost)
+        } else {
+            specializedBudget.addAndGet(cost)
+        }
+        return t
+    }
+
+    /** キャッシュに残せる残りの量 (Int の個数) */
+    private val specializedBudget = java.util.concurrent.atomic.AtomicLong(SPECIALIZED_CACHE_INTS)
+
+    private fun specializeUncached(channel: Int, stream: Int): MaTree {
         val map = IntArray(size) { -1 }
         val order = IntArrayList()
         fun resolve(start: Int): Int {
@@ -171,6 +294,8 @@ internal class IntArrayList(capacity: Int = 16) {
         if (size == a.size) a = a.copyOf(a.size * 2)
         a[size++] = v
     }
+
+    fun pop(): Int = a[--size]
 
     operator fun get(i: Int): Int = a[i]
     fun toArray(): IntArray = a.copyOf(size)
@@ -388,13 +513,25 @@ internal class ModularImage(
     val channels: MutableList<Channel>,
     val nbMetaChannels: Int,
     val bitDepth: Int,
+    /** 書き込み先に直接復号しているか (finish の結果は書き込み先の配列を指す) */
+    val direct: Boolean = false,
 ) {
     companion object {
         /**
          * ヘッダと (必要なら) 木を読み、変換後のチャンネルを用意する。
          * [channelsIn] は幅・高さ・シフトだけを使う。
          */
-        fun read(br: BitReader, channelsIn: List<Channel>, globalTree: MaTree?, bitDepth: Int): ModularImage {
+        fun read(
+            br: BitReader,
+            channelsIn: List<Channel>,
+            globalTree: MaTree?,
+            bitDepth: Int,
+            /**
+             * channelsIn と同じ並びの書き込み先 (offset・stride 付き)。変換が RCT だけ (チャンネルの並びと大きさが
+             * 変わらない) なら、配列を確保せずここに直接復号する。[ModularImage.direct] でどちらになったか分かる
+             */
+            targets: List<Channel>? = null,
+        ): ModularImage {
             val header = ModularHeader.parse(br)
             val chans = channelsIn.map { it.copyMeta() }.toMutableList()
             var nbMeta = 0
@@ -409,8 +546,16 @@ internal class ModularImage(
                 for (c in chans) samples += c.width.toLong() * c.height
                 MaTree.parse(br, minOf(1024L + samples, 1L shl 20).toInt())
             }
-            for (c in chans) c.allocate()
-            return ModularImage(header, tree, channelsIn, chans, nbMeta, bitDepth)
+            val direct = targets != null && header.transforms.all { it is Transform.Rct }
+            if (direct) {
+                for (i in chans.indices) {
+                    val t = targets[i]
+                    chans[i].bind(t.data, t.offset, t.stride)
+                }
+            } else {
+                for (c in chans) c.allocate()
+            }
+            return ModularImage(header, tree, channelsIn, chans, nbMeta, bitDepth, direct)
         }
 
         private fun applyMeta(tr: Transform, chans: MutableList<Channel>, nbMetaIn: Int): Int {
@@ -581,55 +726,57 @@ internal class ModularImage(
     }
 }
 
+/** RCT の並べ替え: 出力チャンネル k に入るのは、逆変換した 3 つの値 (d, e, f) のうち RCT_PERM[perm][k] 番目 */
+private val RCT_PERM = arrayOf(
+    intArrayOf(0, 1, 2), intArrayOf(2, 0, 1), intArrayOf(1, 2, 0),
+    intArrayOf(0, 2, 1), intArrayOf(1, 0, 2), intArrayOf(2, 1, 0),
+)
+
 internal fun inverseRct(tr: Transform.Rct, chans: MutableList<Channel>) {
-    val a = chans[tr.beginC].data
-    val b = chans[tr.beginC + 1].data
-    val c = chans[tr.beginC + 2].data
-    val perm = tr.type / 7
-    val type = tr.type % 7
-    val n = a.size
-    for (i in 0 until n) {
-        val va = a[i]
-        val vb = b[i]
-        val vc = c[i]
-        var d: Int
-        var e: Int
-        var f: Int
-        if (type == 6) {
-            val tmp = va - (vc shr 1)
-            e = vc + tmp
-            f = tmp - (vb shr 1)
-            d = f + vb
-        } else {
-            d = va
-            f = if (type and 1 != 0) vc + va else vc
-            e = when (type shr 1) {
-                1 -> vb + va
-                2 -> vb + ((va + f) shr 1)
-                else -> vb
-            }
-        }
-        a[i] = d
-        b[i] = e
-        c[i] = f
-    }
-    // チャンネルの並べ替え
     val ca = chans[tr.beginC]
     val cb = chans[tr.beginC + 1]
     val cc = chans[tr.beginC + 2]
-    when (perm) {
-        1 -> { swapData(ca, cb); swapData(ca, cc) }
-        2 -> { swapData(ca, cb); swapData(cb, cc) }
-        3 -> swapData(cb, cc)
-        4 -> swapData(ca, cb)
-        5 -> swapData(ca, cc)
+    val a = ca.data
+    val b = cb.data
+    val c = cc.data
+    val pm = RCT_PERM[tr.type / 7]
+    val pa = pm[0]
+    val pb = pm[1]
+    val type = tr.type % 7
+    val w = ca.width
+    // チャンネルはグループの矩形 (offset・stride) のこともあるので行ごとに処理する
+    for (y in 0 until ca.height) {
+        val ia = ca.offset + y * ca.stride
+        val ib = cb.offset + y * cb.stride
+        val ic = cc.offset + y * cc.stride
+        for (x in 0 until w) {
+            val va = a[ia + x]
+            val vb = b[ib + x]
+            val vc = c[ic + x]
+            val d: Int
+            val e: Int
+            val f: Int
+            if (type == 6) {
+                val tmp = va - (vc shr 1)
+                e = vc + tmp
+                f = tmp - (vb shr 1)
+                d = f + vb
+            } else {
+                d = va
+                f = if (type and 1 != 0) vc + va else vc
+                e = when (type shr 1) {
+                    1 -> vb + va
+                    2 -> vb + ((va + f) shr 1)
+                    else -> vb
+                }
+            }
+            // 並べ替え (pa, pb が決まれば残りは 3 - pa - pb)
+            a[ia + x] = if (pa == 0) d else if (pa == 1) e else f
+            b[ib + x] = if (pb == 0) d else if (pb == 1) e else f
+            val pc = 3 - pa - pb
+            c[ic + x] = if (pc == 0) d else if (pc == 1) e else f
+        }
     }
-}
-
-private fun swapData(a: Channel, b: Channel) {
-    val t = a.data
-    a.data = b.data
-    b.data = t
 }
 
 private val DELTA_PALETTE = intArrayOf(

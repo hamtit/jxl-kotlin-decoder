@@ -350,9 +350,17 @@ internal class FrameDecoder(
 
     private fun decodeModularGroup(br: BitReader, parts: List<GroupChannel>, stream: Int) {
         if (parts.isEmpty()) return
-        val img = ModularImage.read(br, parts.map { it.ch }, lfGlobal.globalTree, image.bitDepth.bitsPerSample)
-        val result = img.decodeAll(br, stream)
         val g = lfGlobal.gmodular!!.channels
+        // グローバルのチャンネルの矩形をそのまま書き込み先にする (変換が RCT だけなら一時配列とコピーがいらない)
+        val targets = parts.map { p ->
+            val dst = g[p.index]
+            Channel(p.ch.width, p.ch.height, p.ch.hshift, p.ch.vshift).also {
+                it.bind(dst.data, p.y0 * dst.width + p.x0, dst.width)
+            }
+        }
+        val img = ModularImage.read(br, parts.map { it.ch }, lfGlobal.globalTree, image.bitDepth.bitsPerSample, targets)
+        val result = img.decodeAll(br, stream)
+        if (img.direct) return
         for ((k, p) in parts.withIndex()) {
             val dst = g[p.index]
             val src = result[k]
