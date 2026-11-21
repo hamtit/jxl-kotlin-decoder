@@ -616,7 +616,7 @@ internal class FrameDecoder(
             gbw = minOf(gd / 8, bw - gx * (gd / 8))
             gbh = minOf(gd / 8, bh - gy * (gd / 8))
             gs = groupScratch.poll() ?: GroupScratch(gd * gd)
-            for (c in 0 until 3) gs.coeffs[c].fill(0, 0, ((gbw shr hShift[c]) * 8) * ((gbh shr vShift[c]) * 8))
+            for (c in 0 until 3) gs.coeffs[c].fill(0f, 0, ((gbw shr hShift[c]) * 8) * ((gbh shr vShift[c]) * 8))
         }
         try {
             for (p in 0 until header.passes.numPasses) {
@@ -633,10 +633,12 @@ internal class FrameDecoder(
         }
     }
 
-    /** グループの係数と逆変換の作業領域。グループごとに確保せず、並列に動くタスクの数だけ作って使い回す */
+    /**
+     * グループの係数と逆変換の作業領域。グループごとに確保せず、並列に動くタスクの数だけ作って使い回す。
+     * 量子化された係数 (整数) も浮動小数点で持ち、その場で逆量子化する (2^24 未満の整数は正確に表せる)
+     */
     private class GroupScratch(size: Int) {
-        val coeffs = Array(3) { IntArray(size) }
-        val fcoeff = Array(3) { FloatArray(size) }
+        val coeffs = Array(3) { FloatArray(size) }
         val scratch = FloatArray(512)
         val tmp = FloatArray(64)
         val lfBuf = FloatArray(32 * 32)
@@ -645,7 +647,7 @@ internal class FrameDecoder(
 
     private val groupScratch = java.util.concurrent.ConcurrentLinkedQueue<GroupScratch>()
 
-    private fun decodeHfCoefficients(br: BitReader, pass: Int, gx: Int, gy: Int, gbw: Int, gbh: Int, out: Array<IntArray>) {
+    private fun decodeHfCoefficients(br: BitReader, pass: Int, gx: Int, gy: Int, gbw: Int, gbh: Int, out: Array<FloatArray>) {
         val ctx = lfGlobal.blockCtx!!
         val hfPass = hfPasses[pass]
         val shift = if (pass < header.passes.shift.size) header.passes.shift[pass] else 0
@@ -749,7 +751,7 @@ internal class FrameDecoder(
                         if (transpose) {
                             val tmp = dx; dx = dy; dy = tmp
                         }
-                        coeff[(sy * 8 + dy) * cw + sx * 8 + dx] += v
+                        coeff[(sy * 8 + dy) * cw + sx * 8 + dx] += v.toFloat()
                         prevNz = 1
                         nonZeros--
                         if (nonZeros == 0) break
@@ -774,14 +776,12 @@ internal class FrameDecoder(
             Math.pow(0.8, (header.xQmScale - 2).toDouble()).toFloat(), 1f,
             Math.pow(0.8, (header.bQmScale - 2).toDouble()).toFloat(),
         )
-        val fcoeff = gs.fcoeff
-        for (c in 0 until 3) fcoeff[c].fill(0f, 0, ((gbw shr hShift[c]) * 8) * ((gbh shr vShift[c]) * 8))
+        val fcoeff = coeffs
         val qb = image.quantBias
         val qbn = image.quantBiasNumerator
         for (c in 0 until 3) {
             val cw = (gbw shr hShift[c]) * 8
-            val src = coeffs[c]
-            val dst = fcoeff[c]
+            val dst = coeffs[c]
             forEachVarblock(c, gbw, gbh, bx0, by0) { sx, sy, t, mul ->
                 val bwv = Tt.BW[t] * 8
                 val bhv = Tt.BH[t] * 8
@@ -791,10 +791,9 @@ internal class FrameDecoder(
                     val row = (sy * 8 + yy) * cw + sx * 8
                     val mrow = yy * bwv
                     for (xx in 0 until bwv) {
-                        val q = src[row + xx]
-                        if (q == 0) continue
-                        val qf = q.toFloat()
-                        val v = if (q == 1 || q == -1) qf * qb[c] else qf - qbn / qf
+                        val qf = dst[row + xx]
+                        if (qf == 0f) continue
+                        val v = if (qf == 1f || qf == -1f) qf * qb[c] else qf - qbn / qf
                         dst[row + xx] = v * m[mrow + xx] * scale
                     }
                 }
@@ -1170,6 +1169,7 @@ internal class FrameDecoder(
         val scratchPool = java.util.concurrent.ConcurrentLinkedQueue<Filters.EpfScratch>()
         val threads = if (executor == null) 1 else Runtime.getRuntime().availableProcessors()
         val rs = w + 6
+        val band = (BAND_PIXELS / w).coerceIn(16, 64)
 
         fun finalizeBand(y0: Int, y1: Int, sc: Filters.EpfScratch) {
             // 帯の行 y0..y1 の色 (XYB)。画素 (x, y) は rows[c][(y - lo) * rs + x + 3]
@@ -1231,7 +1231,7 @@ internal class FrameDecoder(
 
         fun finalize(a: Int, b: Int) {
             if (a >= b) return
-            // スレッドごとに連続した行をまとめて受け持ち、その中を最大 BAND 行の帯に分ける
+            // スレッドごとに連続した行をまとめて受け持ち、その中を最大 band 行の帯に分ける
             val tasks = maxOf(1, minOf(threads, (b - a + 15) / 16))
             val per = (b - a + tasks - 1) / tasks
             parallelFor(executor, tasks) { k ->
@@ -1241,7 +1241,7 @@ internal class FrameDecoder(
                     val tb = minOf(b, ta + per)
                     var y0 = ta
                     while (y0 < tb) {
-                        val y1 = minOf(tb, y0 + BAND)
+                        val y1 = minOf(tb, y0 + band)
                         finalizeBand(y0, y1, sc)
                         y0 = y1
                     }
@@ -1322,8 +1322,11 @@ internal class FrameDecoder(
     companion object {
         val TIMING = System.getenv("JXL_TIMING") != null
 
-        /** 逐次描画で一度に仕上げる帯の最大の行数 (大きいほど EPF の重なりの再計算が減る) */
-        private const val BAND = 64
+        /**
+         * 逐次描画で一度に仕上げる帯の画素数の目安。帯が高いほど EPF の重なりの再計算が減るが、
+         * スレッドごとの作業領域が増えるので、幅に応じて 16〜64 行にする
+         */
+        private const val BAND_PIXELS = 64 * 1024
 
         fun to8(v: Float): Int {
             val f = v * 255f + 0.5f

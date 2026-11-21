@@ -152,8 +152,8 @@ internal object Filters {
         var b: Array<FloatArray> = Array(3) { FloatArray(0) }
         var hd = FloatArray(0)
         var vd = FloatArray(0)
-        var sh = FloatArray(0)
-        var sv = FloatArray(0)
+        var rowA = FloatArray(0)
+        var rowB = FloatArray(0)
         lateinit var result: Array<FloatArray>
         var resultLo = 0
 
@@ -164,12 +164,14 @@ internal object Filters {
             }
         }
 
-        fun ensureDiff(n: Int) {
+        fun ensureDiff(n: Int, pw: Int) {
             if (hd.size < n) {
                 hd = FloatArray(n)
                 vd = FloatArray(n)
-                sh = FloatArray(n)
-                sv = FloatArray(n)
+            }
+            if (rowA.size < pw) {
+                rowA = FloatArray(pw)
+                rowB = FloatArray(pw)
             }
         }
     }
@@ -254,7 +256,7 @@ internal object Filters {
         val plus = step == 1
         // 差分は画像の行 ya-2 .. yb+1 について計算する (局所行 0 = ya-2)
         val rows = (yb - ya) + 4
-        scratch.ensureDiff(rows * pw)
+        scratch.ensureDiff(rows * pw, pw)
         val hd = scratch.hd
         val vd = scratch.vd
         for (r in 0 until rows) {
@@ -275,19 +277,13 @@ internal object Filters {
                 }
             }
         }
-        var sh = hd
-        var sv = vd
+        val sh = hd
+        val sv = vd
         if (plus) {
-            sh = scratch.sh
-            sv = scratch.sv
-            for (r in 1 until rows - 1) {
-                val lb = r * pw
-                for (x in 1 until pw - 2) {
-                    val i = lb + x
-                    sh[i] = hd[i] + hd[i - pw] + hd[i + pw] + hd[i - 1] + hd[i + 1]
-                    sv[i] = vd[i] + vd[i - pw] + vd[i + pw] + vd[i - 1] + vd[i + 1]
-                }
-            }
+            // 段階 1 は差分の 5 点 (十字) の和を使う。上の行から順にその場で書き換える
+            // (上の行の元の値は rowA・rowB に退避する)
+            sumCross(hd, rows, pw, scratch)
+            sumCross(vd, rows, pw, scratch)
         }
         for (y in ya until yb) {
             val yBorder = ((y + 1) and 6) == 0
@@ -329,6 +325,23 @@ internal object Filters {
                 bx = xEnd
             }
             for (c in 0 until 3) padRow(out[c], orow, w)
+        }
+    }
+
+    /** d の行 1..rows-2、列 1..pw-3 を、元の値の 5 点 (自分・上下左右) の和で置き換える */
+    private fun sumCross(d: FloatArray, rows: Int, pw: Int, scratch: EpfScratch) {
+        var prev = scratch.rowA
+        var cur = scratch.rowB
+        System.arraycopy(d, 0, prev, 0, pw)
+        for (r in 1 until rows - 1) {
+            val lb = r * pw
+            System.arraycopy(d, lb, cur, 0, pw)
+            for (x in 1 until pw - 2) {
+                d[lb + x] = cur[x] + prev[x] + d[lb + pw + x] + cur[x - 1] + cur[x + 1]
+            }
+            val t = prev
+            prev = cur
+            cur = t
         }
     }
 
