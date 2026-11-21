@@ -54,6 +54,8 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
     private var finished = false
     private var visibleFrames = 0
     private var invisibleSinceVisible = 0
+    /** 次に読むフレームの番号 (表示しないフレームも数える) */
+    private var frameIndex = 0
     private val executor: ExecutorService? = options.executor ?: if (options.threads <= 1) null else sharedPool(options.threads)
 
     public lateinit var info: JxlInfo
@@ -103,6 +105,7 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
     /** 最初のフレームから読み直す */
     public fun rewind() {
         pos = firstFramePos
+        frameIndex = 0
         refs = arrayOfNulls(4)
         lfFrames = arrayOfNulls(4)
         finished = false
@@ -140,8 +143,12 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         // libjxl と同じく、表示フレームの番号は 1 から、非表示フレームの番号は直前の表示フレームから数える
         val seed = if (fh.isKeyframe) (visibleFrames + 1).toLong() shl 32
         else (visibleFrames.toLong() shl 32) + invisibleSinceVisible + 1
-        // 最後の 1 枚で、キャンバス全体を置き換えるなら逐次描画できる (全体の浮動小数点の平面を持たない)
-        val streamable = fh.isLast && fh.isNormalFrame && fh.x0 == 0 && fh.y0 == 0 &&
+        val index = frameIndex++
+        // 保存しても後のフレームが使わない参照は持たない
+        val keepRef = fh.canReference && referenceUsedLater(index, fh.saveAsReference)
+        // 表示するフレームで、参照として持つ必要がなく、キャンバス全体を置き換えるなら逐次描画できる
+        // (全体の浮動小数点の平面を持たない)。静止画の最後の 1 枚と、前のフレームに重ねないアニメーションのフレーム
+        val streamable = fh.isKeyframe && !keepRef && fh.x0 == 0 && fh.y0 == 0 &&
             fh.width == header.width && fh.height == header.height &&
             fh.blending.mode == BlendMode.REPLACE && fh.ecBlending.all { it.mode == BlendMode.REPLACE }
         val stream = if (streamable) FrameDecoder.StreamOutput() else null
@@ -149,7 +156,10 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         pos = end.toInt()
         if (fh.isLast) finished = true
         val streamed = stream?.pixels
+        // 使われない参照は、このフレームの復号 (パッチ・ブレンド) が終わったら手放す
+        val dropRef = fh.canReference && !keepRef
         if (streamed != null) {
+            if (dropRef) refs[fh.saveAsReference] = null
             visibleFrames++
             invisibleSinceVisible = 0
             return orient(streamed, header.width, header.height, frameDuration(fh))
@@ -163,7 +173,7 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         }
 
         if (fh.saveBeforeCt && fh.canReference) {
-            refs[fh.saveAsReference] = ReferenceFrame(img)
+            if (keepRef) refs[fh.saveAsReference] = ReferenceFrame(img)
             if (!fh.isKeyframe) {
                 invisibleSinceVisible++
                 return null
@@ -176,12 +186,13 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
 
         // 色変換 (ブレンドは出力の色空間で行う)
         var t0 = System.nanoTime()
-        val converted = if (fh.saveBeforeCt && fh.canReference) copyImage(img) else img
+        val converted = if (fh.saveBeforeCt && keepRef) copyImage(img) else img
         convertColor(converted)
         if (FrameDecoder.TIMING) System.err.println("  %-14s %7.2f ms".format("color", (System.nanoTime() - t0) / 1e6))
         t0 = System.nanoTime()
         val canvas = blend(fh, converted)
-        if (fh.canReference && !fh.saveBeforeCt) refs[fh.saveAsReference] = ReferenceFrame(canvas)
+        if (keepRef && !fh.saveBeforeCt) refs[fh.saveAsReference] = ReferenceFrame(canvas)
+        if (dropRef) refs[fh.saveAsReference] = null
 
         if (!fh.isKeyframe) {
             invisibleSinceVisible++
@@ -192,6 +203,47 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         val out = toOutput(canvas, frameDuration(fh))
         if (FrameDecoder.TIMING) System.err.println("  %-14s %7.2f ms".format("blend+output", (System.nanoTime() - t0) / 1e6))
         return out
+    }
+
+    /** 各フレームのヘッダー (先頭から順に。読めなかったところで終わる)。最初に必要になったときに読む */
+    private val frameHeaders: List<FrameHeader> by lazy {
+        val list = ArrayList<FrameHeader>()
+        var p = firstFramePos
+        try {
+            while (p < codestream.size) {
+                val br = BitReader(codestream, p, codestream.size)
+                val fh = FrameHeader.parse(br, header)
+                val end = Toc.parse(br, fh).end
+                if (end > codestream.size) break
+                list.add(fh)
+                if (fh.isLast) break
+                p = end.toInt()
+            }
+        } catch (e: JxlException) {
+            // 壊れたところは、そのフレームを復号するときにエラーにする
+        } catch (e: RuntimeException) {
+        }
+        list
+    }
+
+    /**
+     * index 番目のフレームが参照 [slot] に保存する内容を、後のフレームが使うか。
+     * 同じ場所に次の参照が保存されるフレームまでを見る。ヘッダーを読めなかったフレームやパッチを使うフレームがあれば、使うものとする
+     */
+    private fun referenceUsedLater(index: Int, slot: Int): Boolean {
+        val headers = frameHeaders
+        for (j in index + 1 until headers.size) {
+            val f = headers[j]
+            if (f.hasPatches) return true
+            if (f.isNormalFrame) {
+                val fullReplace = f.x0 == 0 && f.y0 == 0 && f.width == header.width && f.height == header.height &&
+                    f.blending.mode == BlendMode.REPLACE && f.ecBlending.all { it.mode == BlendMode.REPLACE }
+                if (!fullReplace && (f.blending.source == slot || f.ecBlending.any { it.source == slot })) return true
+            }
+            if (f.canReference && f.saveAsReference == slot) return false
+            if (f.isLast) return false
+        }
+        return true
     }
 
     private fun frameDuration(fh: FrameHeader): Int {
