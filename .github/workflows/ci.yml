@@ -1,6 +1,8 @@
 name: CI
 
-# PRs and pushes compile with warnings as errors and build/test on Linux x64 and arm64, then verify the jars.
+# PRs and pushes compile with warnings as errors and build/test on Linux arm64, then verify the jars.
+# The jar is platform independent JVM bytecode, so the tests run once, on arm64 like Android devices
+# (its weaker memory model is also the stricter check for the multithreaded decoding).
 # Merging a version bump (gradle.properties) to main creates v<version> and a GitHub release.
 # Pushing a matching tag is also supported. Nothing is published elsewhere; Gradle can use the release as an ivy repository.
 on:
@@ -93,11 +95,7 @@ jobs:
 
   build:
     needs: config
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -116,7 +114,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-reports-${{ matrix.runner }}
+          name: test-reports
           path: jxl-decoder/build/reports/tests
 
   package:
@@ -187,7 +185,7 @@ jobs:
 
           Gradle: \`implementation("io.github.hamtit:jxl-decoder:${VERSION}")\` with this repository's releases as an ivy repository (see README).
 
-          Built and tested on Linux x64 and arm64, including comparisons with libjxl's output.
+          Built and tested on Linux arm64, including comparisons with libjxl's output.
           The packaged jar is also used to decode a lossless image, which must match libjxl exactly.
           EOF
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then

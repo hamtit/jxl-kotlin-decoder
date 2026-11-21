@@ -110,7 +110,7 @@ cli/build/install/cli/bin/cli compare in.jxl ref.png   # PSNR と最大誤差
 
 バージョンは `gradle.properties` の `version` だけで決まります。上げて `main` にマージすると、CI (`.github/workflows/ci.yml`) が `v<version>` のタグと GitHub のリリース (jar・ソースの jar・SHA256SUMS) を作ります。同じバージョンのタグを手で push しても同じようにリリースされます (タグと `gradle.properties` が食い違うと失敗します)。
 
-CI は PR と `main` への push のたびに、警告をエラーにしたコンパイル、Linux x64・arm64 でのビルドとテスト、jar の中身 (ライセンス・Java 17 のクラス) と jar での復号の確認を行います。
+CI は PR と `main` への push のたびに、警告をエラーにしたコンパイル、Linux arm64 でのビルドとテスト (jar は CPU によらないので、Android 端末と同じ arm64 で 1 回だけ)、jar の中身 (ライセンス・Java 17 のクラス) と jar での復号の確認を行います。
 
 ## 謝辞
 
