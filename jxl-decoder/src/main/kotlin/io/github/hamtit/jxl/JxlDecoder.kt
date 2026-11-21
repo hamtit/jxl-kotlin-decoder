@@ -143,7 +143,7 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         // libjxl と同じく、表示フレームの番号は 1 から、非表示フレームの番号は直前の表示フレームから数える
         val seed = if (fh.isKeyframe) (visibleFrames + 1).toLong() shl 32
         else (visibleFrames.toLong() shl 32) + invisibleSinceVisible + 1
-        val index = frameIndex++
+        val index = frameIndex
         // 保存しても後のフレームが使わない参照は持たない
         val keepRef = fh.canReference && referenceUsedLater(index, fh.saveAsReference)
         // 表示するフレームで、参照として持つ必要がなく、キャンバス全体を置き換えるなら逐次描画できる
@@ -154,6 +154,7 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         val stream = if (streamable) FrameDecoder.StreamOutput() else null
         val decoded = FrameDecoder(header, fh, codestream, toc, refs, lfFrames, executor, seed).decode(stream)
         pos = end.toInt()
+        frameIndex++
         if (fh.isLast) finished = true
         val streamed = stream?.pixels
         // 使われない参照は、このフレームの復号 (パッチ・ブレンド) が終わったら手放す
@@ -205,25 +206,38 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         return out
     }
 
-    /** 各フレームのヘッダー (先頭から順に。読めなかったところで終わる)。最初に必要になったときに読む */
-    private val frameHeaders: List<FrameHeader> by lazy {
-        val list = ArrayList<FrameHeader>()
-        var p = firstFramePos
-        try {
-            while (p < codestream.size) {
-                val br = BitReader(codestream, p, codestream.size)
+    // 参照を使うか決めるために先読みしたフレームのヘッダー (先頭から順に)。必要になった分だけ読む
+    private val scannedHeaders = ArrayList<FrameHeader>()
+    private var scanPos = -1
+    private var scanDone = false
+
+    /** j 番目のフレームのヘッダー。読めない (壊れている・終わりを越える) なら null */
+    private fun headerAt(j: Int): FrameHeader? {
+        if (scanPos < 0) scanPos = firstFramePos
+        while (scannedHeaders.size <= j && !scanDone) {
+            try {
+                if (scanPos >= codestream.size) {
+                    scanDone = true
+                    break
+                }
+                val br = BitReader(codestream, scanPos, codestream.size)
                 val fh = FrameHeader.parse(br, header)
                 val end = Toc.parse(br, fh).end
-                if (end > codestream.size) break
-                list.add(fh)
-                if (fh.isLast) break
-                p = end.toInt()
+                if (end > codestream.size) {
+                    scanDone = true
+                    break
+                }
+                scannedHeaders.add(fh)
+                if (fh.isLast) scanDone = true
+                scanPos = end.toInt()
+            } catch (e: JxlException) {
+                // 壊れたところは、そのフレームを復号するときにエラーにする
+                scanDone = true
+            } catch (e: RuntimeException) {
+                scanDone = true
             }
-        } catch (e: JxlException) {
-            // 壊れたところは、そのフレームを復号するときにエラーにする
-        } catch (e: RuntimeException) {
         }
-        list
+        return scannedHeaders.getOrNull(j)
     }
 
     /**
@@ -231,9 +245,9 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
      * 同じ場所に次の参照が保存されるフレームまでを見る。ヘッダーを読めなかったフレームやパッチを使うフレームがあれば、使うものとする
      */
     private fun referenceUsedLater(index: Int, slot: Int): Boolean {
-        val headers = frameHeaders
-        for (j in index + 1 until headers.size) {
-            val f = headers[j]
+        var j = index + 1
+        while (true) {
+            val f = headerAt(j++) ?: return true
             if (f.hasPatches) return true
             if (f.isNormalFrame) {
                 val fullReplace = f.x0 == 0 && f.y0 == 0 && f.width == header.width && f.height == header.height &&
@@ -243,7 +257,6 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
             if (f.canReference && f.saveAsReference == slot) return false
             if (f.isLast) return false
         }
-        return true
     }
 
     private fun frameDuration(fh: FrameHeader): Int {

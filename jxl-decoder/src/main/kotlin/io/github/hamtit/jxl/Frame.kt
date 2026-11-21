@@ -615,19 +615,34 @@ internal class FrameDecoder(
         if (vardct) {
             gbw = minOf(gd / 8, bw - gx * (gd / 8))
             gbh = minOf(gd / 8, bh - gy * (gd / 8))
-            gs = groupScratch.poll() ?: GroupScratch(gd * gd)
-            for (c in 0 until 3) gs.coeffs[c].fill(0f, 0, ((gbw shr hShift[c]) * 8) * ((gbh shr vShift[c]) * 8))
+            gs = groupScratch.poll() ?: GroupScratch(minOf(gd, bw * 8) * minOf(gd, bh * 8), header.passes.numPasses > 1)
+            for (c in 0 until 3) {
+                val n = ((gbw shr hShift[c]) * 8) * ((gbh shr vShift[c]) * 8)
+                gs.coeffs[c].fill(0f, 0, n)
+                gs.intCoeffs?.get(c)?.fill(0, 0, n)
+            }
         }
         try {
             for (p in 0 until header.passes.numPasses) {
                 val br = passGroupSection(p, g)
-                if (vardct) decodeHfCoefficients(br, p, gx, gy, gbw, gbh, gs!!.coeffs)
+                if (vardct) decodeHfCoefficients(br, p, gx, gy, gbw, gbh, gs!!)
                 val mm = header.passes.downsamplingBracket(p)
                 val parts = groupChannels(false, gx, gy, mm[0], mm[1])
                 decodeModularGroup(br, parts, 1 + 3 * numLf + 17 + p * numGroups + g)
                 if (!toc.singleEntry) br.checkOverrun()
             }
-            if (vardct) reconstructGroup(gx, gy, gbw, gbh, gs!!, target, targetY0)
+            if (vardct) {
+                // 複数のパスの係数は整数で足し合わせてから、一度だけ浮動小数点にする
+                gs!!.intCoeffs?.let { ints ->
+                    for (c in 0 until 3) {
+                        val n = ((gbw shr hShift[c]) * 8) * ((gbh shr vShift[c]) * 8)
+                        val src = ints[c]
+                        val dst = gs.coeffs[c]
+                        for (i in 0 until n) dst[i] = src[i].toFloat()
+                    }
+                }
+                reconstructGroup(gx, gy, gbw, gbh, gs, target, targetY0)
+            }
         } finally {
             if (gs != null) groupScratch.offer(gs)
         }
@@ -635,10 +650,13 @@ internal class FrameDecoder(
 
     /**
      * グループの係数と逆変換の作業領域。グループごとに確保せず、並列に動くタスクの数だけ作って使い回す。
-     * 量子化された係数 (整数) も浮動小数点で持ち、その場で逆量子化する (2^24 未満の整数は正確に表せる)
+     * パスが 1 つなら、量子化された係数 (整数) を浮動小数点の配列に直接書き、その場で逆量子化する
+     * (各係数は一度だけ書かれるので、整数から変換するのと同じ値になる)。
+     * 複数のパスがあるときは [intCoeffs] に整数で足し合わせる
      */
-    private class GroupScratch(size: Int) {
+    private class GroupScratch(size: Int, multiPass: Boolean) {
         val coeffs = Array(3) { FloatArray(size) }
+        val intCoeffs: Array<IntArray>? = if (multiPass) Array(3) { IntArray(size) } else null
         val scratch = FloatArray(512)
         val tmp = FloatArray(64)
         val lfBuf = FloatArray(32 * 32)
@@ -647,7 +665,9 @@ internal class FrameDecoder(
 
     private val groupScratch = java.util.concurrent.ConcurrentLinkedQueue<GroupScratch>()
 
-    private fun decodeHfCoefficients(br: BitReader, pass: Int, gx: Int, gy: Int, gbw: Int, gbh: Int, out: Array<FloatArray>) {
+    private fun decodeHfCoefficients(br: BitReader, pass: Int, gx: Int, gy: Int, gbw: Int, gbh: Int, gs: GroupScratch) {
+        val outF = gs.coeffs
+        val outI = gs.intCoeffs
         val ctx = lfGlobal.blockCtx!!
         val hfPass = hfPasses[pass]
         val shift = if (pass < header.passes.shift.size) header.passes.shift[pass] else 0
@@ -724,7 +744,8 @@ internal class FrameDecoder(
                         if (sx + dx < nzr.size) nzr[sx + dx] = nzVal
                     }
                     if (nonZeros == 0) continue
-                    val coeff = out[c]
+                    val coeffF = outF[c]
+                    val coeffI = outI?.get(c)
                     val cw = (gbw shr hs) * 8
                     var prevNz = if (nonZeros <= numBlocks * 4) 1 else 0
                     val order = hfPass.orders[orderId][c]!!
@@ -751,7 +772,8 @@ internal class FrameDecoder(
                         if (transpose) {
                             val tmp = dx; dx = dy; dy = tmp
                         }
-                        coeff[(sy * 8 + dy) * cw + sx * 8 + dx] += v.toFloat()
+                        val ci = (sy * 8 + dy) * cw + sx * 8 + dx
+                        if (coeffI != null) coeffI[ci] += v else coeffF[ci] = v.toFloat()
                         prevNz = 1
                         nonZeros--
                         if (nonZeros == 0) break
