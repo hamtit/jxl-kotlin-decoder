@@ -57,7 +57,7 @@ dependencies { implementation("com.github.hamtit.jxl-kotlin-decoder:jxl-decoder:
 
 ## 正確さ
 
-libjxl の `djxl` で 8 ビットに復号した結果と比べ、全画素の差が非可逆で ±1 以内 (丸めの違い)、可逆で完全一致です。`jxl-decoder/src/test` に cjxl などで作った画像と djxl の出力を入れてあり、`./gradlew test` で確かめます。
+libjxl の `djxl` で 8 ビットに復号した結果と比べ、全画素の差が非可逆で ±1 以内 (丸めの違い)、可逆で完全一致です。`jxl-decoder/src/test` に cjxl などで作った画像と djxl の出力を入れてあり、`./gradlew test` で確かめます。テスト画像は [Kodak の画像セット](https://r0k.us/graphics/kodak/) の一部を切り抜いたものと、スクリプトで描いた画像 (文字・グラデーション・アニメーション) です。
 
 [libjxl の conformance テスト](https://github.com/libjxl/conformance) 40 件では、次の 7 件以外が djxl と ±1 以内で一致しました。
 
