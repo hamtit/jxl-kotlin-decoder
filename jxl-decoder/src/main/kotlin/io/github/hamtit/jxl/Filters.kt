@@ -115,35 +115,82 @@ internal object Filters {
                 else if (y >= ye) System.arraycopy(sv[c], (halo + y - ye) * w, dst, off, w)
                 else System.arraycopy(planes[c], y * w, dst, off, w)
             }
-            var pending: Array<FloatArray>? = null
+            // 2 組の作業領域を交互に使う (前の帯の結果は、次の帯の入力を読み終えてから書き戻す)
+            var cur = EpfScratch()
+            var prev = EpfScratch()
             var pendingY0 = 0
             var pendingY1 = 0
+            fun writeBack(sc: EpfScratch) {
+                for (c in 0 until 3) {
+                    val src = sc.result[c]
+                    for (y in pendingY0 until pendingY1) System.arraycopy(src, (y - sc.resultLo) * (w + 6) + 3, planes[c], y * w, w)
+                }
+            }
             var y0 = ys
             while (y0 < ye) {
                 val y1 = minOf(ye, y0 + band)
-                val out = epfBand(::inputRow, y0, y1, w, h, halo, steps, radius, params, sigma, sigmaStride)
-                // 前の帯の結果は、この帯の入力を読み終えてから書き戻す
-                pending?.let { p -> for (c in 0 until 3) System.arraycopy(p[c], 0, planes[c], pendingY0 * w, (pendingY1 - pendingY0) * w) }
-                pending = out
+                epfBand(::inputRow, y0, y1, w, h, halo, steps, radius, params, sigma, sigmaStride, cur)
+                if (pendingY1 > pendingY0) writeBack(prev)
                 pendingY0 = y0
                 pendingY1 = y1
+                val t = prev
+                prev = cur
+                cur = t
                 y0 = y1
             }
-            pending?.let { p -> for (c in 0 until 3) System.arraycopy(p[c], 0, planes[c], pendingY0 * w, (pendingY1 - pendingY0) * w) }
+            if (pendingY1 > pendingY0) writeBack(prev)
         }
         return colors
     }
 
-    /** 帯 (行 y0..y1) の全段階を計算する。結果は行の長さ w の 3 平面 */
+    /**
+     * EPF の帯の計算に使う作業領域。帯ごとに確保し直さず、同じスレッドで使い回す。
+     * 結果は [result] の 3 平面 (行の長さ w + 6、画素は列 3 から、画像の行 [resultLo] から始まる)。
+     */
+    class EpfScratch {
+        var a: Array<FloatArray> = Array(3) { FloatArray(0) }
+        var b: Array<FloatArray> = Array(3) { FloatArray(0) }
+        var hd = FloatArray(0)
+        var vd = FloatArray(0)
+        var rowA = FloatArray(0)
+        var rowB = FloatArray(0)
+        lateinit var result: Array<FloatArray>
+        var resultLo = 0
+
+        fun ensure(n: Int) {
+            if (a[0].size < n) {
+                a = Array(3) { FloatArray(n) }
+                b = Array(3) { FloatArray(n) }
+            }
+        }
+
+        fun ensureDiff(n: Int, pw: Int) {
+            if (hd.size < n) {
+                hd = FloatArray(n)
+                vd = FloatArray(n)
+            }
+            if (rowA.size < pw) {
+                rowA = FloatArray(pw)
+                rowB = FloatArray(pw)
+            }
+        }
+    }
+
+    /**
+     * 帯 (行 y0..y1) の全段階を計算する。結果は [EpfScratch.result] (行の長さ w + 6) に入る:
+     * 画素 (x, y) は result[c][(y - resultLo) * (w + 6) + x + 3]
+     */
     fun epfBand(
         inputRow: (Int, Int, FloatArray, Int) -> Unit,
         y0: Int, y1: Int, w: Int, h: Int, halo: Int, steps: IntArray, radius: IntArray,
-        params: EpfParams, sigma: FloatArray?, sigmaStride: Int,
-    ): Array<FloatArray> {
+        params: EpfParams, sigma: FloatArray?, sigmaStride: Int, scratch: EpfScratch,
+    ) {
         val pw = w + 6
         var lo = y0 - halo
         var hi = y1 + halo
-        var cur = Array(3) { FloatArray((hi - lo) * pw) }
+        scratch.ensure((hi - lo) * pw)
+        var cur = scratch.a
+        var next = scratch.b
         for (c in 0 until 3) {
             for (y in lo until hi) {
                 val row = (y - lo) * pw
@@ -155,26 +202,24 @@ internal object Filters {
             val r = radius[k]
             val nlo = lo + r
             val nhi = hi - r
-            val next = Array(3) { FloatArray((nhi - nlo) * pw) }
             val ya = maxOf(nlo, 0)
             val yb = minOf(nhi, h)
             if (step == 0) epfStep0(cur, lo, next, nlo, ya, yb, w, params, sigma, sigmaStride)
-            else epfStep12(cur, lo, next, nlo, ya, yb, w, params, sigma, sigmaStride, step)
+            else epfStep12(cur, lo, hi - lo, next, nlo, ya, yb, w, params, sigma, sigmaStride, step, scratch)
             // 画像の外の行は、計算した行を鏡映して埋める
             for (y in nlo until nhi) {
                 if (y in ya until yb) continue
                 val sy = mirror(y, h)
                 for (c in 0 until 3) System.arraycopy(next[c], (sy - nlo) * pw, next[c], (y - nlo) * pw, pw)
             }
+            val t = cur
             cur = next
+            next = t
             lo = nlo
             hi = nhi
         }
-        return Array(3) { c ->
-            val o = FloatArray((y1 - y0) * w)
-            for (y in y0 until y1) System.arraycopy(cur[c], (y - lo) * pw + 3, o, (y - y0) * w, w)
-            o
-        }
+        scratch.result = cur
+        scratch.resultLo = lo
     }
 
     /** 行の左右 3 画素を鏡映で埋める (row は行の先頭、画素は row+3 から) */
@@ -193,8 +238,8 @@ internal object Filters {
      * 隣の画素との重み付き差分 H (右)・V (下) を先に求め、距離はその和で表す。
      */
     private fun epfStep12(
-        inp: Array<FloatArray>, inLo: Int, out: Array<FloatArray>, outLo: Int, ya: Int, yb: Int, w: Int,
-        params: EpfParams, sigma: FloatArray?, sigmaStride: Int, step: Int,
+        inp: Array<FloatArray>, inLo: Int, inRows: Int, out: Array<FloatArray>, outLo: Int, ya: Int, yb: Int, w: Int,
+        params: EpfParams, sigma: FloatArray?, sigmaStride: Int, step: Int, scratch: EpfScratch,
     ) {
         val pw = w + 6
         val stepMul = if (step == 2) params.pass2SigmaScale else 1f
@@ -211,9 +256,9 @@ internal object Filters {
         val plus = step == 1
         // 差分は画像の行 ya-2 .. yb+1 について計算する (局所行 0 = ya-2)
         val rows = (yb - ya) + 4
-        val hd = FloatArray(rows * pw)
-        val vd = FloatArray(rows * pw)
-        val inRows = inp[0].size / pw
+        scratch.ensureDiff(rows * pw, pw)
+        val hd = scratch.hd
+        val vd = scratch.vd
         for (r in 0 until rows) {
             val iy = ya - 2 + r - inLo
             if (iy < 0 || iy >= inRows) continue
@@ -232,19 +277,13 @@ internal object Filters {
                 }
             }
         }
-        var sh = hd
-        var sv = vd
+        val sh = hd
+        val sv = vd
         if (plus) {
-            sh = FloatArray(rows * pw)
-            sv = FloatArray(rows * pw)
-            for (r in 1 until rows - 1) {
-                val lb = r * pw
-                for (x in 1 until pw - 2) {
-                    val i = lb + x
-                    sh[i] = hd[i] + hd[i - pw] + hd[i + pw] + hd[i - 1] + hd[i + 1]
-                    sv[i] = vd[i] + vd[i - pw] + vd[i + pw] + vd[i - 1] + vd[i + 1]
-                }
-            }
+            // 段階 1 は差分の 5 点 (十字) の和を使う。上の行から順にその場で書き換える
+            // (上の行の元の値は rowA・rowB に退避する)
+            sumCross(hd, rows, pw, scratch)
+            sumCross(vd, rows, pw, scratch)
         }
         for (y in ya until yb) {
             val yBorder = ((y + 1) and 6) == 0
@@ -286,6 +325,23 @@ internal object Filters {
                 bx = xEnd
             }
             for (c in 0 until 3) padRow(out[c], orow, w)
+        }
+    }
+
+    /** d の行 1..rows-2、列 1..pw-3 を、元の値の 5 点 (自分・上下左右) の和で置き換える */
+    private fun sumCross(d: FloatArray, rows: Int, pw: Int, scratch: EpfScratch) {
+        var prev = scratch.rowA
+        var cur = scratch.rowB
+        System.arraycopy(d, 0, prev, 0, pw)
+        for (r in 1 until rows - 1) {
+            val lb = r * pw
+            System.arraycopy(d, lb, cur, 0, pw)
+            for (x in 1 until pw - 2) {
+                d[lb + x] = cur[x] + prev[x] + d[lb + pw + x] + cur[x - 1] + cur[x + 1]
+            }
+            val t = prev
+            prev = cur
+            cur = t
         }
     }
 

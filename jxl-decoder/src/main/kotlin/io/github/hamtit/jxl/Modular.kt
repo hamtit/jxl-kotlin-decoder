@@ -176,7 +176,9 @@ internal class IntArrayList(capacity: Int = 16) {
     fun toArray(): IntArray = a.copyOf(size)
 }
 
-/** 自己補正予測器 (weighted predictor) */
+/**
+ * 自己補正予測器 (weighted predictor)。4 つの部分予測は配列にせず個別の変数で持つ (画素ごとに呼ばれるため)
+ */
 internal class WeightedPredictor(private val width: Int, private val wp: WpParams) {
     private val trueErrRow = IntArray(width)
     private val subErrRow = IntArray(width * 4)
@@ -186,55 +188,74 @@ internal class WeightedPredictor(private val width: Int, private val wp: WpParam
     private var teNW = 0
     private var teN = 0
     private var teNE = 0
-    private val seNWWW = IntArray(4)
-    private val seNW = IntArray(4)
-    private val seNE = IntArray(4)
-    private val subpred = LongArray(4)
-    private val weight = IntArray(4)
+    // 部分予測ごとの誤差 (NWWW: 2 つ前の NW、NW、NE)
+    private var nwww0 = 0
+    private var nwww1 = 0
+    private var nwww2 = 0
+    private var nwww3 = 0
+    private var nw0 = 0
+    private var nw1 = 0
+    private var nw2 = 0
+    private var nw3 = 0
+    private var ne0 = 0
+    private var ne1 = 0
+    private var ne2 = 0
+    private var ne3 = 0
+    private var sp0 = 0L
+    private var sp1 = 0L
+    private var sp2 = 0L
+    private var sp3 = 0L
+    private val maxW0 = wp.w0.toLong()
+    private val maxW1 = wp.w1.toLong()
+    private val maxW2 = wp.w2.toLong()
+    private val maxW3 = wp.w3.toLong()
     var prediction = 0L
         private set
     var maxError = 0
         private set
+
+    private fun weightOf(a: Int, b: Int, c: Int, maxW: Long): Long {
+        val e = ((a.toLong() and 0xffffffffL) + (b.toLong() and 0xffffffffL) + (c.toLong() and 0xffffffffL)) and 0xffffffffL
+        val t = (e + 1) shr 5
+        val shift = if (t == 0L) 0 else 63 - java.lang.Long.numberOfLeadingZeros(t)
+        return 4 + ((maxW * DIV_LOOKUP[((e shr shift) + 1).toInt()]) shr shift)
+    }
 
     fun predict(n: Int, nw: Int, ne: Int, w: Int, nn: Int) {
         val tw = teW.toLong()
         val tnw = teNW.toLong()
         val tn = teN.toLong()
         val tne = teNE.toLong()
-        val n3 = n.toLong() shl 3
-        val nw3 = nw.toLong() shl 3
-        val ne3 = ne.toLong() shl 3
-        val w3 = w.toLong() shl 3
-        val nn3 = nn.toLong() shl 3
-        subpred[0] = w3 + ne3 - n3
-        subpred[1] = n3 - (((tw + tn + tne) * wp.p1) shr 5)
-        subpred[2] = w3 - (((tw + tn + tnw) * wp.p2) shr 5)
-        subpred[3] = n3 - ((tnw * wp.p3a + tn * wp.p3b + tne * wp.p3c + (nn3 - n3) * wp.p3d + (nw3 - w3) * wp.p3e) shr 5)
+        val nS = n.toLong() shl 3
+        val nwS = nw.toLong() shl 3
+        val neS = ne.toLong() shl 3
+        val wS = w.toLong() shl 3
+        val nnS = nn.toLong() shl 3
+        val s0 = wS + neS - nS
+        val s1 = nS - (((tw + tn + tne) * wp.p1) shr 5)
+        val s2 = wS - (((tw + tn + tnw) * wp.p2) shr 5)
+        val s3 = nS - ((tnw * wp.p3a + tn * wp.p3b + tne * wp.p3c + (nnS - nS) * wp.p3d + (nwS - wS) * wp.p3e) shr 5)
+        sp0 = s0
+        sp1 = s1
+        sp2 = s2
+        sp3 = s3
 
-        var sumW = 0L
-        for (i in 0 until 4) {
-            val errSum = (seNWWW[i].toLong() and 0xffffffffL) + (seNW[i].toLong() and 0xffffffffL) +
-                (seNE[i].toLong() and 0xffffffffL)
-            val e = errSum and 0xffffffffL
-            val t = (e + 1) shr 5
-            val shift = if (t == 0L) 0 else 63 - java.lang.Long.numberOfLeadingZeros(t)
-            val maxW = when (i) { 0 -> wp.w0; 1 -> wp.w1; 2 -> wp.w2; else -> wp.w3 }
-            val wv = 4 + ((maxW.toLong() * DIV_LOOKUP[((e shr shift) + 1).toInt()]) shr shift)
-            weight[i] = wv.toInt()
-            sumW += wv
-        }
-        val logWeight = 63 - java.lang.Long.numberOfLeadingZeros(sumW shr 4)
-        var sumW2 = 0
-        for (i in 0 until 4) {
-            weight[i] = weight[i] ushr logWeight
-            sumW2 += weight[i]
-        }
-        var s = (sumW2.toLong() shr 1) - 1
-        for (i in 0 until 4) s += subpred[i] * weight[i]
-        var pred = (s * DIV_LOOKUP[sumW2]) shr 24
+        val w0 = weightOf(nwww0, nw0, ne0, maxW0)
+        val w1 = weightOf(nwww1, nw1, ne1, maxW1)
+        val w2 = weightOf(nwww2, nw2, ne2, maxW2)
+        val w3 = weightOf(nwww3, nw3, ne3, maxW3)
+        val logWeight = 63 - java.lang.Long.numberOfLeadingZeros((w0 + w1 + w2 + w3) shr 4)
+        // 重みは Int に切り詰めてから (元の実装と同じ) 右シフトする
+        val v0 = w0.toInt() ushr logWeight
+        val v1 = w1.toInt() ushr logWeight
+        val v2 = w2.toInt() ushr logWeight
+        val v3 = w3.toInt() ushr logWeight
+        val sumW2 = v0 + v1 + v2 + v3
+        val sum = (sumW2.toLong() shr 1) - 1 + s0 * v0 + s1 * v1 + s2 * v2 + s3 * v3
+        var pred = (sum * DIV_LOOKUP[sumW2]) shr 24
         if (((tn xor tw) or (tn xor tnw)) <= 0) {
-            val mn = minOf(n3, minOf(w3, ne3))
-            val mx = maxOf(n3, maxOf(w3, ne3))
+            val mn = minOf(nS, minOf(wS, neS))
+            val mx = maxOf(nS, maxOf(wS, neS))
             pred = pred.coerceIn(mn, mx)
         }
         prediction = pred
@@ -249,9 +270,15 @@ internal class WeightedPredictor(private val width: Int, private val wp: WpParam
         val s8 = sample.toLong() shl 3
         val trueErr = (prediction - s8).toInt()
         val base = x * 4
-        for (i in 0 until 4) {
-            subErrRow[base + i] = ((kotlin.math.abs(subpred[i] - s8) + 3) shr 3).toInt()
-        }
+        val row = subErrRow
+        val e0 = ((kotlin.math.abs(sp0 - s8) + 3) shr 3).toInt()
+        val e1 = ((kotlin.math.abs(sp1 - s8) + 3) shr 3).toInt()
+        val e2 = ((kotlin.math.abs(sp2 - s8) + 3) shr 3).toInt()
+        val e3 = ((kotlin.math.abs(sp3 - s8) + 3) shr 3).toInt()
+        row[base] = e0
+        row[base + 1] = e1
+        row[base + 2] = e2
+        row[base + 3] = e3
         trueErrRow[x] = trueErr
         x++
         if (x >= width) {
@@ -260,29 +287,28 @@ internal class WeightedPredictor(private val width: Int, private val wp: WpParam
             teW = 0
             teN = trueErrRow[0]
             teNW = teN
-            for (i in 0 until 4) seNW[i] = subErrRow[i]
-            for (i in 0 until 4) seNWWW[i] = seNW[i]
+            nw0 = row[0]; nw1 = row[1]; nw2 = row[2]; nw3 = row[3]
+            nwww0 = nw0; nwww1 = nw1; nwww2 = nw2; nwww3 = nw3
             if (width <= 1) {
                 teNE = teN
-                for (i in 0 until 4) seNE[i] = seNW[i]
+                ne0 = nw0; ne1 = nw1; ne2 = nw2; ne3 = nw3
             } else {
                 teNE = trueErrRow[1]
-                for (i in 0 until 4) seNE[i] = subErrRow[4 + i]
+                ne0 = row[4]; ne1 = row[5]; ne2 = row[6]; ne3 = row[7]
             }
         } else {
             teW = trueErr
             teNW = teN
             teN = teNE
-            for (i in 0 until 4) {
-                seNWWW[i] = seNW[i]
-                seNW[i] = seNE[i] + subErrRow[base + i]
-            }
+            nwww0 = nw0; nwww1 = nw1; nwww2 = nw2; nwww3 = nw3
+            nw0 = ne0 + e0; nw1 = ne1 + e1; nw2 = ne2 + e2; nw3 = ne3 + e3
             if (x + 1 >= width) {
                 teNE = teN
-                for (i in 0 until 4) seNE[i] = seNW[i]
+                ne0 = nw0; ne1 = nw1; ne2 = nw2; ne3 = nw3
             } else if (y != 0) {
                 teNE = trueErrRow[x + 1]
-                for (i in 0 until 4) seNE[i] = subErrRow[(x + 1) * 4 + i]
+                val nb = (x + 1) * 4
+                ne0 = row[nb]; ne1 = row[nb + 1]; ne2 = row[nb + 2]; ne3 = row[nb + 3]
             }
         }
     }

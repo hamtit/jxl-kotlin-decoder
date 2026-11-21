@@ -23,7 +23,21 @@ internal class BitReader(private val data: ByteArray, private val start: Int, pr
 
     private fun refill() {
         val n = (63 - bits) ushr 3
-        if (pos + n <= end) {
+        if (end - pos >= 8) {
+            // 8 バイトをまとめて読み、入る分だけ進める。buf の bits より上には続きのビットが入るが、
+            // 次の refill で同じ位置に同じ値を OR するだけなので変わらない
+            val d = data
+            val p = pos
+            val v = (d[p].toLong() and 0xff) or ((d[p + 1].toLong() and 0xff) shl 8) or
+                ((d[p + 2].toLong() and 0xff) shl 16) or ((d[p + 3].toLong() and 0xff) shl 24) or
+                ((d[p + 4].toLong() and 0xff) shl 32) or ((d[p + 5].toLong() and 0xff) shl 40) or
+                ((d[p + 6].toLong() and 0xff) shl 48) or ((d[p + 7].toLong() and 0xff) shl 56)
+            buf = buf or (v shl bits)
+            pos = p + n
+            bits += n shl 3
+            return
+        }
+        if (end - pos >= n) {
             val d = data
             var p = pos
             var b = bits
