@@ -50,6 +50,11 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
     private var firstFramePos: Int = 0
     private var pos: Int = 0
     private var refs = arrayOfNulls<ReferenceFrame>(4)
+    /**
+     * ARGB で持つ参照 (キャンバス全体の大きさ、向きは反映前)。後のフレームが置き換え (REPLACE) で
+     * 重ねるだけの参照は、浮動小数点の平面 ([refs]) の代わりにこちらで持つ。同じ番号は片方にしか入らない
+     */
+    private var argbRefs = arrayOfNulls<IntArray>(4)
     private var lfFrames = arrayOfNulls<FrameImage>(4)
     private var finished = false
     private var visibleFrames = 0
@@ -107,6 +112,7 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         pos = firstFramePos
         frameIndex = 0
         refs = arrayOfNulls(4)
+        argbRefs = arrayOfNulls(4)
         lfFrames = arrayOfNulls(4)
         finished = false
         visibleFrames = 0
@@ -146,25 +152,15 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         val index = frameIndex
         // 保存しても後のフレームが使わない参照は持たない
         val keepRef = fh.canReference && referenceUsedLater(index, fh.saveAsReference)
-        // 表示するフレームで、参照として持つ必要がなく、キャンバス全体を置き換えるなら逐次描画できる
-        // (全体の浮動小数点の平面を持たない)。静止画の最後の 1 枚と、前のフレームに重ねないアニメーションのフレーム
-        val streamable = fh.isKeyframe && !keepRef && fh.x0 == 0 && fh.y0 == 0 &&
-            fh.width == header.width && fh.height == header.height &&
-            fh.blending.mode == BlendMode.REPLACE && fh.ecBlending.all { it.mode == BlendMode.REPLACE }
-        val stream = if (streamable) FrameDecoder.StreamOutput() else null
-        val decoded = FrameDecoder(header, fh, codestream, toc, refs, lfFrames, executor, seed).decode(stream)
+        // 使われない参照は、このフレームの復号 (パッチ・ブレンド) が終わったら手放す
+        val dropRef = fh.canReference && !keepRef
+        if (canUseArgbCanvas(fh, index, keepRef)) {
+            return decodeOntoArgbCanvas(fh, toc, seed, keepRef, end)
+        }
+        val decoded = FrameDecoder(header, fh, codestream, toc, refs, lfFrames, executor, seed).decode(null)
         pos = end.toInt()
         frameIndex++
         if (fh.isLast) finished = true
-        val streamed = stream?.pixels
-        // 使われない参照は、このフレームの復号 (パッチ・ブレンド) が終わったら手放す
-        val dropRef = fh.canReference && !keepRef
-        if (streamed != null) {
-            if (dropRef) refs[fh.saveAsReference] = null
-            visibleFrames++
-            invisibleSinceVisible = 0
-            return orient(streamed, header.width, header.height, frameDuration(fh))
-        }
         val img = decoded!!
 
         if (fh.frameType == FrameType.LF) {
@@ -174,7 +170,7 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         }
 
         if (fh.saveBeforeCt && fh.canReference) {
-            if (keepRef) refs[fh.saveAsReference] = ReferenceFrame(img)
+            if (keepRef) setFloatRef(fh.saveAsReference, ReferenceFrame(img))
             if (!fh.isKeyframe) {
                 invisibleSinceVisible++
                 return null
@@ -192,8 +188,8 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         if (FrameDecoder.TIMING) System.err.println("  %-14s %7.2f ms".format("color", (System.nanoTime() - t0) / 1e6))
         t0 = System.nanoTime()
         val canvas = blend(fh, converted)
-        if (keepRef && !fh.saveBeforeCt) refs[fh.saveAsReference] = ReferenceFrame(canvas)
-        if (dropRef) refs[fh.saveAsReference] = null
+        if (keepRef && !fh.saveBeforeCt) setFloatRef(fh.saveAsReference, ReferenceFrame(canvas))
+        if (dropRef) setFloatRef(fh.saveAsReference, null)
 
         if (!fh.isKeyframe) {
             invisibleSinceVisible++
@@ -206,8 +202,105 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         return out
     }
 
+    private fun setFloatRef(slot: Int, ref: ReferenceFrame?) {
+        refs[slot] = ref
+        argbRefs[slot] = null
+    }
+
+    // ---------------- 置き換えだけで重ねるフレーム (ARGB のキャンバス) ----------------
+
+    /** 色・追加チャンネルとも置き換え (REPLACE) で重ねるフレームか */
+    private fun replacesOnly(f: FrameHeader): Boolean =
+        f.blending.mode == BlendMode.REPLACE && f.ecBlending.all { it.mode == BlendMode.REPLACE }
+
+    /** フレームがキャンバス全体を覆うか (重ねる元を見ない) */
+    private fun coversCanvas(f: FrameHeader): Boolean =
+        f.x0 <= 0 && f.y0 <= 0 && f.x0.toLong() + f.width >= header.width && f.y0.toLong() + f.height >= header.height
+
+    /**
+     * フレームを、浮動小数点のキャンバスを作らずに ARGB のキャンバスへ描けるか。
+     * 置き換えで重ねるなら、キャンバスの各画素はどれか 1 つのフレームの値そのものなので、8 ビットで持っても出力は変わらない。
+     * 保存する参照を後のフレームが置き換え以外で使う (またはパッチで使う) なら、浮動小数点で持つ必要があるので使わない
+     */
+    private fun canUseArgbCanvas(fh: FrameHeader, index: Int, keepRef: Boolean): Boolean {
+        if (!fh.isNormalFrame || !replacesOnly(fh)) return false
+        if (keepRef && (fh.saveBeforeCt || !argbRefSuffices(index, fh.saveAsReference))) return false
+        if (!coversCanvas(fh)) {
+            // 重ねる元が浮動小数点の参照なら、今までどおり浮動小数点で重ねる
+            if (refs[fh.blending.source] != null) return false
+            // 追加チャンネルを色と別の参照に重ねるなら、1 枚の ARGB では表せない
+            if (fh.ecBlending.any { it.source != fh.blending.source }) return false
+        }
+        return true
+    }
+
+    /**
+     * index 番目のフレームが参照 [slot] に保存する内容を、後のフレームが置き換えで重ねる元としてだけ使うか
+     * (同じ場所に次の参照が保存されるまで)。ヘッダーを読めなかったフレームがあれば false
+     */
+    private fun argbRefSuffices(index: Int, slot: Int): Boolean {
+        var j = index + 1
+        while (true) {
+            val f = headerAt(j) ?: return false
+            if ((scannedPatchSlots[j++] shr slot) and 1 != 0) return false
+            // キャンバス全体を置き換えるフレームは重ねる元を見ない
+            if (f.isNormalFrame && !(coversCanvas(f) && replacesOnly(f)) &&
+                (f.blending.source == slot || f.ecBlending.any { it.source == slot })
+            ) {
+                if (!replacesOnly(f) || f.blending.source != slot || f.ecBlending.any { it.source != slot }) return false
+            }
+            if (f.canReference && f.saveAsReference == slot) return true
+            if (f.isLast) return true
+        }
+    }
+
+    private fun decodeOntoArgbCanvas(fh: FrameHeader, toc: Toc, seed: Long, keepRef: Boolean, end: Long): JxlFrame? {
+        val w = header.width
+        val h = header.height
+        val src = fh.blending.source
+        val save = fh.saveAsReference
+        val base = argbRefs[src]
+        val canvas: IntArray = when {
+            coversCanvas(fh) -> IntArray(Plane.checkedSize(w, h))
+            base == null -> IntArray(Plane.checkedSize(w, h)).also {
+                // 何もないところは透明な黒 (アルファがなければ不透明な黒)
+                if (header.alphaChannel < 0) it.fill(0xff shl 24)
+            }
+            // 元の参照をこのフレームが置き換える (または捨てる) なら、その配列にそのまま描く
+            fh.canReference && save == src -> base
+            else -> base.copyOf()
+        }
+        if (canvas === base) argbRefs[src] = null
+        val stream = FrameDecoder.StreamOutput(canvas, w, h, fh.x0, fh.y0)
+        val decoded = FrameDecoder(header, fh, codestream, toc, refs, lfFrames, executor, seed).decode(stream)
+        pos = end.toInt()
+        frameIndex++
+        if (fh.isLast) finished = true
+        if (stream.pixels == null) {
+            // 逐次描画できないフレームは、浮動小数点で復号して色を変換してから描く
+            val img = decoded!!
+            convertColor(img)
+            writeArgb(img, canvas, w, h, fh.x0, fh.y0)
+        }
+        if (fh.canReference) {
+            refs[save] = null
+            argbRefs[save] = if (keepRef) canvas else null
+        }
+        if (!fh.isKeyframe) {
+            invisibleSinceVisible++
+            return null
+        }
+        visibleFrames++
+        invisibleSinceVisible = 0
+        // 参照として持つキャンバスは後のフレームが書き換えるので、出力には写しを渡す
+        val pixels = if (fh.canReference && keepRef) canvas.copyOf() else canvas
+        return orient(pixels, w, h, frameDuration(fh))
+    }
+
     // 参照を使うか決めるために先読みしたフレームのヘッダー (先頭から順に)。必要になった分だけ読む
     private val scannedHeaders = ArrayList<FrameHeader>()
+    // 先読みしたフレームのパッチが参照する番号 (ビット i が参照 i)。パッチがなければ 0
+    private val scannedPatchSlots = ArrayList<Int>()
     private var scanPos = -1
     private var scanDone = false
 
@@ -222,12 +315,14 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
                 }
                 val br = BitReader(codestream, scanPos, codestream.size)
                 val fh = FrameHeader.parse(br, header)
-                val end = Toc.parse(br, fh).end
+                val toc = Toc.parse(br, fh)
+                val end = toc.end
                 if (end > codestream.size) {
                     scanDone = true
                     break
                 }
                 scannedHeaders.add(fh)
+                scannedPatchSlots.add(if (fh.hasPatches) patchSlots(fh, toc) else 0)
                 if (fh.isLast) scanDone = true
                 scanPos = end.toInt()
             } catch (e: JxlException) {
@@ -241,14 +336,29 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
     }
 
     /**
+     * パッチが参照する番号の集合 (ビット i が参照 i)。パッチの辞書 (LfGlobal の先頭) だけを読む。
+     * 読めなければ全ての番号を使うものとする (壊れたところは、そのフレームを復号するときにエラーにする)
+     */
+    private fun patchSlots(fh: FrameHeader, toc: Toc): Int = try {
+        val br = BitReader(codestream, toc.offsets[0], toc.offsets[0] + toc.sizes[0])
+        var mask = 0
+        for (p in Patches.parse(br, header, fh).refs) mask = mask or (1 shl p.refIdx)
+        mask
+    } catch (e: JxlException) {
+        0xf
+    } catch (e: RuntimeException) {
+        0xf
+    }
+
+    /**
      * index 番目のフレームが参照 [slot] に保存する内容を、後のフレームが使うか。
-     * 同じ場所に次の参照が保存されるフレームまでを見る。ヘッダーを読めなかったフレームやパッチを使うフレームがあれば、使うものとする
+     * 同じ場所に次の参照が保存されるフレームまでを見る。ヘッダーを読めなかったフレームや、その参照をパッチで使うフレームがあれば、使うものとする
      */
     private fun referenceUsedLater(index: Int, slot: Int): Boolean {
         var j = index + 1
         while (true) {
-            val f = headerAt(j++) ?: return true
-            if (f.hasPatches) return true
+            val f = headerAt(j) ?: return true
+            if ((scannedPatchSlots[j++] shr slot) and 1 != 0) return true
             if (f.isNormalFrame) {
                 val fullReplace = f.x0 == 0 && f.y0 == 0 && f.width == header.width && f.height == header.height &&
                     f.blending.mode == BlendMode.REPLACE && f.ecBlending.all { it.mode == BlendMode.REPLACE }
@@ -300,14 +410,18 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         val outExtra = arrayOfNulls<FloatArray>(numExtra)
         // 元のアルファ (ブレンド中に書き換わる前の値)
         val baseAlphaCache = HashMap<Int, FloatArray?>()
+        // baseChannel が新しく作った配列 (写さずにそのまま書き換えてよい)
+        val fresh = java.util.IdentityHashMap<FloatArray, Unit>()
         fun baseChannel(source: Int, ch: Int): FloatArray? {
-            val r = refs[source]?.image ?: return null
+            val r = refs[source]?.image
+                ?: return argbRefs[source]?.let { argbChannel(it, ch, colorCount).also { a -> fresh[a] = Unit } }
             val arr = if (ch < colorCount) r.color.getOrNull(ch) else r.extra.getOrNull(ch - colorCount)
             if (arr == null || r.width != w || r.height != h) {
                 if (arr == null) return null
                 // 大きさが違う参照 (切り出し) はキャンバスに置き直す
                 val out = FloatArray(w * h)
                 for (y in 0 until minOf(h, r.height)) System.arraycopy(arr, y * r.width, out, y * w, minOf(w, r.width))
+                fresh[out] = Unit
                 return out
             }
             return arr
@@ -321,7 +435,7 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         for (ch in 0 until colorCount + numExtra) {
             val bi = if (ch < colorCount) fh.blending else fh.ecBlending[ch - colorCount]
             val src = baseChannel(bi.source, ch)
-            val base = src?.copyOf() ?: FloatArray(w * h)
+            val base = if (src == null) FloatArray(w * h) else if (fresh.containsKey(src)) src else src.copyOf()
             if (bw > 0 && bh > 0) {
                 val newData = if (ch < colorCount) img.color[ch] else img.extra[ch - colorCount]
                 var mode = when (bi.mode) {
@@ -361,30 +475,63 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
     }
 
     private fun toOutput(img: FrameImage, duration: Int): JxlFrame {
+        val pixels = IntArray(img.width * img.height)
+        writeArgb(img, pixels, img.width, img.height, 0, 0)
+        return orient(pixels, img.width, img.height, duration)
+    }
+
+    /** 色変換済みのフレームを ARGB にして、幅 outW・高さ outH の out の (ox, oy) に書く (はみ出す部分は捨てる) */
+    private fun writeArgb(img: FrameImage, out: IntArray, outW: Int, outH: Int, ox: Int, oy: Int) {
         val w = img.width
-        val h = img.height
-        val n = w * h
-        val pixels = IntArray(n)
         val r = img.color[0]
         val g = if (img.color.size >= 3) img.color[1] else r
         val b = if (img.color.size >= 3) img.color[2] else r
         val alphaIdx = header.alphaChannel
         val alpha = if (alphaIdx >= 0) img.extra[alphaIdx] else null
         val premul = alphaIdx >= 0 && header.extraChannels[alphaIdx].alphaAssociated
-        parallelRows(executor, h) { y0, y1 ->
-            for (i in y0 * w until y1 * w) {
-                var a = 1f
-                if (alpha != null) a = alpha[i].coerceIn(0f, 1f)
-                var rv = r[i]
-                var gv = g[i]
-                var bv = b[i]
-                if (premul && a > 0f) {
-                    rv /= a; gv /= a; bv /= a
+        val xa = maxOf(0, -ox)
+        val xb = minOf(w, outW - ox)
+        val ya = maxOf(0, -oy)
+        val yb = minOf(img.height, outH - oy)
+        if (xb <= xa || yb <= ya) return
+        parallelRows(executor, yb - ya) { r0, r1 ->
+            for (y in ya + r0 until ya + r1) {
+                val o = (y + oy) * outW + ox
+                for (x in xa until xb) {
+                    val i = y * w + x
+                    var a = 1f
+                    if (alpha != null) a = alpha[i].coerceIn(0f, 1f)
+                    var rv = r[i]
+                    var gv = g[i]
+                    var bv = b[i]
+                    if (premul && a > 0f) {
+                        rv /= a; gv /= a; bv /= a
+                    }
+                    out[o + x] = (to8(a) shl 24) or (to8(rv) shl 16) or (to8(gv) shl 8) or to8(bv)
                 }
-                pixels[i] = (to8(a) shl 24) or (to8(rv) shl 16) or (to8(gv) shl 8) or to8(bv)
             }
         }
-        return orient(pixels, w, h, duration)
+    }
+
+    /**
+     * ARGB で持つ参照の 1 チャンネルを、浮動小数点のキャンバスと同じ形 (色は sRGB の 0..1、アルファが
+     * 乗算済みなら色にアルファを掛けた値) にする。ch は色チャンネル、続いて追加チャンネルの番号
+     */
+    private fun argbChannel(argb: IntArray, ch: Int, colorCount: Int): FloatArray {
+        val out = FloatArray(argb.size)
+        val alphaIdx = header.alphaChannel
+        val premul = alphaIdx >= 0 && header.extraChannels[alphaIdx].alphaAssociated
+        if (ch >= colorCount) {
+            // アルファ以外の追加チャンネルは ARGB に無い (置き換えで上書きされるので値は使われない)
+            if (ch - colorCount == alphaIdx) for (i in argb.indices) out[i] = (argb[i] ushr 24) / 255f
+            return out
+        }
+        val shift = if (colorCount == 1) 16 else 16 - 8 * ch
+        for (i in argb.indices) {
+            val v = ((argb[i] ushr shift) and 0xff) / 255f
+            out[i] = if (premul) v * ((argb[i] ushr 24) / 255f) else v
+        }
+        return out
     }
 
     /** 向き (orientation) を反映する */

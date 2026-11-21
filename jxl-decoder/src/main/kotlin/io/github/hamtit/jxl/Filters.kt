@@ -116,8 +116,8 @@ internal object Filters {
                 else System.arraycopy(planes[c], y * w, dst, off, w)
             }
             // 2 組の作業領域を交互に使う (前の帯の結果は、次の帯の入力を読み終えてから書き戻す)
-            var cur = EpfScratch()
-            var prev = EpfScratch()
+            var cur = EpfScratch.obtain()
+            var prev = EpfScratch.obtain()
             var pendingY0 = 0
             var pendingY1 = 0
             fun writeBack(sc: EpfScratch) {
@@ -139,6 +139,8 @@ internal object Filters {
                 y0 = y1
             }
             if (pendingY1 > pendingY0) writeBack(prev)
+            cur.recycle()
+            prev.recycle()
         }
         return colors
     }
@@ -173,6 +175,16 @@ internal object Filters {
                 rowA = FloatArray(pw)
                 rowB = FloatArray(pw)
             }
+        }
+
+        /** 使い終わったら [ScratchPool] に返す */
+        fun recycle() {
+            ScratchPool.give(this, 4L * (6L * a[0].size + 2L * hd.size + 2L * rowA.size))
+        }
+
+        companion object {
+            /** [ScratchPool] から取り出す。無ければ新しく作る */
+            fun obtain(): EpfScratch = ScratchPool.take(EpfScratch::class.java) { true } ?: EpfScratch()
         }
     }
 

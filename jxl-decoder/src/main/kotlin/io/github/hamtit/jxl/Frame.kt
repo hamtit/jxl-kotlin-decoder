@@ -170,9 +170,35 @@ internal class FrameDecoder(
         }
     }
 
-    /** 逐次描画したときの出力 (ARGB) */
-    class StreamOutput {
+    /**
+     * 逐次描画したときの出力 (ARGB)。[target] が null ならフレームの大きさの配列を作る。
+     * そうでなければ、幅 [targetW]・高さ [targetH] の [target] の (ox, oy) にフレームを描く (はみ出す部分は捨てる)
+     */
+    class StreamOutput(
+        val target: IntArray? = null,
+        val targetW: Int = 0,
+        val targetH: Int = 0,
+        val ox: Int = 0,
+        val oy: Int = 0,
+    ) {
         var pixels: IntArray? = null
+
+        /** フレームの大きさの ARGB を出力にする */
+        fun put(frame: IntArray, w: Int, h: Int) {
+            val t = target
+            if (t == null) {
+                pixels = frame
+                return
+            }
+            val xa = maxOf(0, -ox)
+            val xb = minOf(w, targetW - ox)
+            if (xb > xa) {
+                for (y in maxOf(0, -oy) until minOf(h, targetH - oy)) {
+                    System.arraycopy(frame, y * w + xa, t, (y + oy) * targetW + ox + xa, xb - xa)
+                }
+            }
+            pixels = t
+        }
     }
 
     /**
@@ -211,7 +237,7 @@ internal class FrameDecoder(
         }
 
         if (stream != null && canStream()) {
-            stream.pixels = decodeStreaming()
+            stream.pixels = decodeStreaming(stream)
             phase("streaming")
             return null
         }
@@ -229,7 +255,7 @@ internal class FrameDecoder(
         val modularChannels = lfGlobal.gmodular?.finish()
         phase("modularFinish")
         if (stream != null && modularChannels != null && canDirectModular()) {
-            stream.pixels = modularToArgb(modularChannels)
+            stream.put(modularToArgb(modularChannels), colorW, colorH)
             phase("modularToArgb")
             return null
         }
@@ -623,7 +649,7 @@ internal class FrameDecoder(
         if (vardct) {
             gbw = minOf(gd / 8, bw - gx * (gd / 8))
             gbh = minOf(gd / 8, bh - gy * (gd / 8))
-            gs = groupScratch.poll() ?: GroupScratch(minOf(gd, bw * 8) * minOf(gd, bh * 8), header.passes.numPasses > 1)
+            gs = GroupScratch.obtain(minOf(gd, bw * 8) * minOf(gd, bh * 8), header.passes.numPasses > 1)
             for (c in 0 until 3) {
                 val n = ((gbw shr hShift[c]) * 8) * ((gbh shr vShift[c]) * 8)
                 gs.coeffs[c].fill(0f, 0, n)
@@ -652,12 +678,12 @@ internal class FrameDecoder(
                 reconstructGroup(gx, gy, gbw, gbh, gs, target, targetY0)
             }
         } finally {
-            if (gs != null) groupScratch.offer(gs)
+            gs?.recycle()
         }
     }
 
     /**
-     * グループの係数と逆変換の作業領域。グループごとに確保せず、並列に動くタスクの数だけ作って使い回す。
+     * グループの係数と逆変換の作業領域。グループごと・フレームごとに確保せず、[ScratchPool] に置いて使い回す。
      * パスが 1 つなら、量子化された係数 (整数) を浮動小数点の配列に直接書き、その場で逆量子化する
      * (各係数は一度だけ書かれるので、整数から変換するのと同じ値になる)。
      * 複数のパスがあるときは [intCoeffs] に整数で足し合わせる
@@ -669,9 +695,17 @@ internal class FrameDecoder(
         val tmp = FloatArray(64)
         val lfBuf = FloatArray(32 * 32)
         val dct = Dct.Scratch()
-    }
 
-    private val groupScratch = java.util.concurrent.ConcurrentLinkedQueue<GroupScratch>()
+        fun recycle() = ScratchPool.give(this, coeffs[0].size * (if (intCoeffs != null) 24L else 12L) + 8192L)
+
+        companion object {
+            fun obtain(size: Int, multiPass: Boolean): GroupScratch =
+                ScratchPool.take(GroupScratch::class.java) {
+                    // 大きすぎるもの (大きいグループ用) を小さい画像に使わない
+                    it.coeffs[0].size >= size && it.coeffs[0].size / 4 <= size && (!multiPass || it.intCoeffs != null)
+                } ?: GroupScratch(size, multiPass)
+        }
+    }
 
     private fun decodeHfCoefficients(br: BitReader, pass: Int, gx: Int, gy: Int, gbw: Int, gbh: Int, gs: GroupScratch) {
         val outF = gs.coeffs
@@ -1124,11 +1158,18 @@ internal class FrameDecoder(
         return true
     }
 
-    private fun decodeStreaming(): IntArray {
+    private fun decodeStreaming(stream: StreamOutput): IntArray {
         val w = colorW
         val h = colorH
         val stride = bw * 8
-        val out = IntArray(Plane.checkedSize(w, h))
+        // 出力先 (キャンバス) と、フレームの置き場所。はみ出す行・列は書かない
+        val out = stream.target ?: IntArray(Plane.checkedSize(w, h))
+        val outW = if (stream.target != null) stream.targetW else w
+        val outH = if (stream.target != null) stream.targetH else h
+        val ox = if (stream.target != null) stream.ox else 0
+        val oy = if (stream.target != null) stream.oy else 0
+        val xa = maxOf(0, -ox)
+        val xb = minOf(w, outW - ox)
         val gab = header.gabor
         val epf = header.epf
         val epfSteps = when (epf?.iters) {
@@ -1147,8 +1188,8 @@ internal class FrameDecoder(
         // 逆 DCT 後の値は、今のグループ行 (行 curY0 から gd 行) と、その直前の carryRows 行だけを持つ。
         // 仕上げ (finalize) が前のグループ行から読むのは、次のグループ行の始まりの 2 * halo + 2 行手前までなので足りる
         val carryRows = minOf(gd, 2 * halo + 2)
-        val cur = Array(3) { FloatArray(stride * gd) }
-        val carry = Array(3) { FloatArray(stride * carryRows) }
+        val cur = Array(3) { ScratchPool.floats(stride * gd) }
+        val carry = Array(3) { ScratchPool.floats(stride * carryRows) }
         var curY0 = 0
 
         // 画像の行 y (範囲内) の逆 DCT 後の値
@@ -1195,8 +1236,7 @@ internal class FrameDecoder(
         val grey = image.colourEncoding.colourSpace == ColourSpace.GREY
         val alphaScale = alphaDepth?.scale() ?: 0f
 
-        // 帯の作業領域。並列に動いているタスクの数だけ作り、使い回す
-        val scratchPool = java.util.concurrent.ConcurrentLinkedQueue<Filters.EpfScratch>()
+        // 帯の作業領域は ScratchPool から取り、帯ごと・フレームごとに確保し直さない
         val threads = if (executor == null) 1 else Runtime.getRuntime().availableProcessors()
         val rs = w + 6
         val band = (BAND_PIXELS / w).coerceIn(16, 64)
@@ -1220,9 +1260,12 @@ internal class FrameDecoder(
             val ry = rows[1]
             val rb = rows[2]
             for (y in y0 until y1) {
+                val ty = y + oy
+                if (ty < 0 || ty >= outH) continue
                 val ro = (y - lo) * rs + 3
                 val oo = y * w
-                for (x in 0 until w) {
+                val to = ty * outW + ox
+                for (x in xa until xb) {
                     val i = ro + x
                     val gl = ry[i] + rx[i] - cb0
                     val gm = ry[i] - rx[i] - cb1
@@ -1250,9 +1293,9 @@ internal class FrameDecoder(
                         if (av > 0f) {
                             sr /= av; sg /= av; sb /= av
                         }
-                        out[oo + x] = (to8(av) shl 24) or (to8(sr) shl 16) or (to8(sg) shl 8) or to8(sb)
+                        out[to + x] = (to8(av) shl 24) or (to8(sr) shl 16) or (to8(sg) shl 8) or to8(sb)
                     } else {
-                        out[oo + x] = (to8(av) shl 24) or (ColorConvert.linearToSrgb8(r) shl 16) or
+                        out[to + x] = (to8(av) shl 24) or (ColorConvert.linearToSrgb8(r) shl 16) or
                             (ColorConvert.linearToSrgb8(g) shl 8) or ColorConvert.linearToSrgb8(bb)
                     }
                 }
@@ -1265,7 +1308,7 @@ internal class FrameDecoder(
             val tasks = maxOf(1, minOf(threads, (b - a + 15) / 16))
             val per = (b - a + tasks - 1) / tasks
             parallelFor(executor, tasks) { k ->
-                val sc = scratchPool.poll() ?: Filters.EpfScratch()
+                val sc = Filters.EpfScratch.obtain()
                 try {
                     val ta = a + k * per
                     val tb = minOf(b, ta + per)
@@ -1276,7 +1319,7 @@ internal class FrameDecoder(
                         y0 = y1
                     }
                 } finally {
-                    scratchPool.offer(sc)
+                    sc.recycle()
                 }
             }
         }
@@ -1296,6 +1339,10 @@ internal class FrameDecoder(
             val ready = if (gy == rowsOfGroups - 1) h else minOf(h, (gy + 1) * gd - halo - 1)
             finalize(finalized, ready)
             finalized = maxOf(finalized, ready)
+        }
+        for (c in 0 until 3) {
+            ScratchPool.give(cur[c])
+            ScratchPool.give(carry[c])
         }
         return out
     }
