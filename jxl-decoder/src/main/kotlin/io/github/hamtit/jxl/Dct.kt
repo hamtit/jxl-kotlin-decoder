@@ -311,10 +311,20 @@ internal object Dct {
         auxIdct2(buf, base, stride, 8, tmp)
     }
 
-    fun dct4(buf: FloatArray, base: Int, stride: Int, tmp: FloatArray) {
-        auxIdct2(buf, base, stride, 2, tmp)
+    /** 小さい変換の作業領域 (ブロックごとに確保しないため) */
+    class Scratch {
         val s = FloatArray(64)
         val sc = FloatArray(16)
+        val coeff = FloatArray(16)
+        val samples = FloatArray(16)
+        val s44 = FloatArray(16)
+        val s48 = FloatArray(32)
+    }
+
+    fun dct4(buf: FloatArray, base: Int, stride: Int, tmp: FloatArray, ds: Scratch) {
+        auxIdct2(buf, base, stride, 2, tmp)
+        val s = ds.s
+        val sc = ds.sc
         for (y in 0 until 2) for (x in 0 until 2) {
             val o = (y * 2 + x) * 16
             for (iy in 0 until 4) for (ix in 0 until 4) {
@@ -329,9 +339,9 @@ internal object Dct {
         }
     }
 
-    fun hornuss(buf: FloatArray, base: Int, stride: Int, tmp: FloatArray) {
+    fun hornuss(buf: FloatArray, base: Int, stride: Int, tmp: FloatArray, ds: Scratch) {
         auxIdct2(buf, base, stride, 2, tmp)
-        val s = FloatArray(64)
+        val s = ds.s
         for (y in 0 until 2) for (x in 0 until 2) {
             val o = (y * 2 + x) * 16
             for (iy in 0 until 4) for (ix in 0 until 4) s[o + iy * 4 + ix] = buf[base + (y + iy * 2) * stride + x + ix * 2]
@@ -348,13 +358,13 @@ internal object Dct {
         }
     }
 
-    fun dct4x8(buf: FloatArray, base: Int, stride: Int, transposed: Boolean) {
+    fun dct4x8(buf: FloatArray, base: Int, stride: Int, transposed: Boolean, ds: Scratch) {
         val c0 = buf[base]
         val c1 = buf[base + stride]
         buf[base] = c0 + c1
         buf[base + stride] = c0 - c1
-        val s = FloatArray(64)
-        val sc = FloatArray(16)
+        val s = ds.s
+        val sc = ds.sc
         for (idx in 0 until 2) {
             val o = idx * 32
             for (iy in 0 until 4) for (ix in 0 until 8) s[o + iy * 8 + ix] = buf[base + (iy * 2 + idx) * stride + ix]
@@ -367,22 +377,23 @@ internal object Dct {
         }
     }
 
-    fun afv(buf: FloatArray, base: Int, stride: Int, n: Int) {
+    fun afv(buf: FloatArray, base: Int, stride: Int, n: Int, ds: Scratch) {
         val flipX = n % 2
         val flipY = n / 2
         fun g(x: Int, y: Int) = buf[base + y * stride + x]
-        val coeff = FloatArray(16)
+        val coeff = ds.coeff
         coeff[0] = (g(0, 0) + g(1, 0) + g(0, 1)) * 4f
         for (idx in 1 until 16) coeff[idx] = g(2 * (idx % 4), 2 * (idx / 4))
-        val samples = FloatArray(16)
+        val samples = ds.samples
+        samples.fill(0f)
         for (k in 0 until 16) {
             val c = coeff[k]
             val basis = AFV_BASIS[k]
             for (i in 0 until 16) samples[i] += c * basis[i]
         }
-        val s44 = FloatArray(16)
-        val s48 = FloatArray(32)
-        val sc = FloatArray(16)
+        val s44 = ds.s44
+        val s48 = ds.s48
+        val sc = ds.sc
         s44[0] = g(0, 0) - g(1, 0) + g(0, 1)
         for (iy in 0 until 4) for (ix in 0 until 4) {
             if (ix or iy == 0) continue

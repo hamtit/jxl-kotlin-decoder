@@ -604,24 +604,41 @@ internal class FrameDecoder(
         val gx = g % header.groupsPerRow
         val gy = g / header.groupsPerRow
         val vardct = !header.isModular
-        var coeffs: Array<IntArray>? = null
+        var gs: GroupScratch? = null
         var gbw = 0
         var gbh = 0
         if (vardct) {
             gbw = minOf(gd / 8, bw - gx * (gd / 8))
             gbh = minOf(gd / 8, bh - gy * (gd / 8))
-            coeffs = Array(3) { c -> IntArray(((gbw shr hShift[c]) * 8) * ((gbh shr vShift[c]) * 8)) }
+            gs = groupScratch.poll() ?: GroupScratch(gd * gd)
+            for (c in 0 until 3) gs.coeffs[c].fill(0, 0, ((gbw shr hShift[c]) * 8) * ((gbh shr vShift[c]) * 8))
         }
-        for (p in 0 until header.passes.numPasses) {
-            val br = passGroupSection(p, g)
-            if (vardct) decodeHfCoefficients(br, p, gx, gy, gbw, gbh, coeffs!!)
-            val mm = header.passes.downsamplingBracket(p)
-            val parts = groupChannels(false, gx, gy, mm[0], mm[1])
-            decodeModularGroup(br, parts, 1 + 3 * numLf + 17 + p * numGroups + g)
-            if (!toc.singleEntry) br.checkOverrun()
+        try {
+            for (p in 0 until header.passes.numPasses) {
+                val br = passGroupSection(p, g)
+                if (vardct) decodeHfCoefficients(br, p, gx, gy, gbw, gbh, gs!!.coeffs)
+                val mm = header.passes.downsamplingBracket(p)
+                val parts = groupChannels(false, gx, gy, mm[0], mm[1])
+                decodeModularGroup(br, parts, 1 + 3 * numLf + 17 + p * numGroups + g)
+                if (!toc.singleEntry) br.checkOverrun()
+            }
+            if (vardct) reconstructGroup(gx, gy, gbw, gbh, gs!!, target, targetY0)
+        } finally {
+            if (gs != null) groupScratch.offer(gs)
         }
-        if (vardct) reconstructGroup(gx, gy, gbw, gbh, coeffs!!, target, targetY0)
     }
+
+    /** グループの係数と逆変換の作業領域。グループごとに確保せず、並列に動くタスクの数だけ作って使い回す */
+    private class GroupScratch(size: Int) {
+        val coeffs = Array(3) { IntArray(size) }
+        val fcoeff = Array(3) { FloatArray(size) }
+        val scratch = FloatArray(512)
+        val tmp = FloatArray(64)
+        val lfBuf = FloatArray(32 * 32)
+        val dct = Dct.Scratch()
+    }
+
+    private val groupScratch = java.util.concurrent.ConcurrentLinkedQueue<GroupScratch>()
 
     private fun decodeHfCoefficients(br: BitReader, pass: Int, gx: Int, gy: Int, gbw: Int, gbh: Int, out: Array<IntArray>) {
         val ctx = lfGlobal.blockCtx!!
@@ -742,8 +759,9 @@ internal class FrameDecoder(
 
     /** 逆量子化・CfL・逆 DCT をして色平面に書き込む */
     private fun reconstructGroup(
-        gx: Int, gy: Int, gbw: Int, gbh: Int, coeffs: Array<IntArray>, target: Array<FloatArray>?, targetY0: Int,
+        gx: Int, gy: Int, gbw: Int, gbh: Int, gs: GroupScratch, target: Array<FloatArray>?, targetY0: Int,
     ) {
+        val coeffs = gs.coeffs
         val qm = quantMatrices!!
         val bx0 = gx * (gd / 8)
         val by0 = gy * (gd / 8)
@@ -751,7 +769,8 @@ internal class FrameDecoder(
             Math.pow(0.8, (header.xQmScale - 2).toDouble()).toFloat(), 1f,
             Math.pow(0.8, (header.bQmScale - 2).toDouble()).toFloat(),
         )
-        val fcoeff = Array(3) { c -> FloatArray(coeffs[c].size) }
+        val fcoeff = gs.fcoeff
+        for (c in 0 until 3) fcoeff[c].fill(0f, 0, ((gbw shr hShift[c]) * 8) * ((gbh shr vShift[c]) * 8))
         val qb = image.quantBias
         val qbn = image.quantBiasNumerator
         for (c in 0 until 3) {
@@ -803,9 +822,9 @@ internal class FrameDecoder(
             }
         }
         // 逆変換
-        val scratch = FloatArray(512)
-        val tmp = FloatArray(64)
-        val lfBuf = FloatArray(32 * 32)
+        val scratch = gs.scratch
+        val tmp = gs.tmp
+        val lfBuf = gs.lfBuf
         for (c in 0 until 3) {
             val cw = (gbw shr hShift[c]) * 8
             val buf = fcoeff[c]
@@ -831,11 +850,11 @@ internal class FrameDecoder(
                 }
                 when (t) {
                     Tt.DCT2 -> Dct.dct2(buf, base, cw, tmp)
-                    Tt.DCT4 -> Dct.dct4(buf, base, cw, tmp)
-                    Tt.HORNUSS -> Dct.hornuss(buf, base, cw, tmp)
-                    Tt.DCT4X8 -> Dct.dct4x8(buf, base, cw, false)
-                    Tt.DCT8X4 -> Dct.dct4x8(buf, base, cw, true)
-                    in Tt.AFV0..Tt.AFV3 -> Dct.afv(buf, base, cw, t - Tt.AFV0)
+                    Tt.DCT4 -> Dct.dct4(buf, base, cw, tmp, gs.dct)
+                    Tt.HORNUSS -> Dct.hornuss(buf, base, cw, tmp, gs.dct)
+                    Tt.DCT4X8 -> Dct.dct4x8(buf, base, cw, false, gs.dct)
+                    Tt.DCT8X4 -> Dct.dct4x8(buf, base, cw, true, gs.dct)
+                    in Tt.AFV0..Tt.AFV3 -> Dct.afv(buf, base, cw, t - Tt.AFV0, gs.dct)
                     else -> Dct.dct2d(buf, base, cw, bwb * 8, bhb * 8, scratch, false)
                 }
             }
@@ -1014,7 +1033,6 @@ internal class FrameDecoder(
         val w = colorW
         val h = colorH
         val stride = bw * 8
-        val bufs = Array(2) { Array(3) { FloatArray(stride * gd) } }
         val out = IntArray(Plane.checkedSize(w, h))
         val gab = header.gabor
         val epf = header.epf
@@ -1031,15 +1049,20 @@ internal class FrameDecoder(
         val alpha = if (alphaIdx >= 0) lfGlobal.gmodular?.channels?.get(alphaIdx) else null
         val alphaDepth = if (alphaIdx >= 0) image.extraChannels[alphaIdx].bitDepth else null
         val premul = alphaIdx >= 0 && image.extraChannels[alphaIdx].alphaAssociated
-        var gyDecoded = -1
+        // 逆 DCT 後の値は、今のグループ行 (行 curY0 から gd 行) と、その直前の carryRows 行だけを持つ。
+        // 仕上げ (finalize) が前のグループ行から読むのは、次のグループ行の始まりの 2 * halo + 2 行手前までなので足りる
+        val carryRows = minOf(gd, 2 * halo + 2)
+        val cur = Array(3) { FloatArray(stride * gd) }
+        val carry = Array(3) { FloatArray(stride * carryRows) }
+        var curY0 = 0
 
         // 画像の行 y (範囲内) の逆 DCT 後の値
         fun idctRow(c: Int, y: Int): FloatArray {
-            val gy = y / gd
-            if (gy != gyDecoded && gy != gyDecoded - 1) error("row not available")
-            return bufs[gy % 2][c]
+            if (y >= curY0) return cur[c]
+            if (y < curY0 - carryRows) error("row not available")
+            return carry[c]
         }
-        fun idctOff(y: Int) = (y % gd) * stride
+        fun idctOff(y: Int) = if (y >= curY0) (y - curY0) * stride else (y - (curY0 - carryRows)) * stride
 
         // Gaborish 後の行 (y は鏡映済みでなくてよい)
         val inputRow: (Int, Int, FloatArray, Int) -> Unit = { c, yy, dst, off ->
@@ -1077,58 +1100,87 @@ internal class FrameDecoder(
         val grey = image.colourEncoding.colourSpace == ColourSpace.GREY
         val alphaScale = alphaDepth?.scale() ?: 0f
 
+        // 帯の作業領域。並列に動いているタスクの数だけ作り、使い回す
+        val scratchPool = java.util.concurrent.ConcurrentLinkedQueue<Filters.EpfScratch>()
+        val threads = if (executor == null) 1 else Runtime.getRuntime().availableProcessors()
+        val rs = w + 6
+
+        fun finalizeBand(y0: Int, y1: Int, sc: Filters.EpfScratch) {
+            // 帯の行 y0..y1 の色 (XYB)。画素 (x, y) は rows[c][(y - lo) * rs + x + 3]
+            val rows: Array<FloatArray>
+            val lo: Int
+            if (epf != null) {
+                Filters.epfBand(inputRow, y0, y1, w, h, epfHalo, epfSteps, epfRadius, epf, epfSigma, bw, sc)
+                rows = sc.result
+                lo = sc.resultLo
+            } else {
+                sc.ensure((y1 - y0) * rs)
+                rows = sc.a
+                lo = y0
+                for (c in 0 until 3) for (y in y0 until y1) inputRow(c, y, rows[c], (y - y0) * rs + 3)
+            }
+            lfGlobal.patches?.let { applyPatchesToBand(it, rows, rs, lo, y0, y1, w, h) }
+            val rx = rows[0]
+            val ry = rows[1]
+            val rb = rows[2]
+            for (y in y0 until y1) {
+                val ro = (y - lo) * rs + 3
+                val oo = y * w
+                for (x in 0 until w) {
+                    val i = ro + x
+                    val gl = ry[i] + rx[i] - cb0
+                    val gm = ry[i] - rx[i] - cb1
+                    val gs = rb[i] - cb2
+                    val ml = (gl * gl * gl + ob[0]) * its
+                    val mm = (gm * gm * gm + ob[1]) * its
+                    val ms = (gs * gs * gs + ob[2]) * its
+                    var r = m[0] * ml + m[1] * mm + m[2] * ms
+                    var g = m[3] * ml + m[4] * mm + m[5] * ms
+                    var bb = m[6] * ml + m[7] * mm + m[8] * ms
+                    if (grey) {
+                        val l = 0.2126f * r + 0.7152f * g + 0.0722f * bb
+                        r = l; g = l; bb = l
+                    }
+                    var av = 1f
+                    if (alpha != null) {
+                        val raw = alpha.data[oo + x]
+                        av = if (alphaDepth!!.isFloat) alphaDepth.parseFloatSample(raw) else raw * alphaScale
+                        if (av < 0f) av = 0f else if (av > 1f) av = 1f
+                    }
+                    if (premul) {
+                        var sr = ColorConvert.srgbEncodeFast(r)
+                        var sg = ColorConvert.srgbEncodeFast(g)
+                        var sb = ColorConvert.srgbEncodeFast(bb)
+                        if (av > 0f) {
+                            sr /= av; sg /= av; sb /= av
+                        }
+                        out[oo + x] = (to8(av) shl 24) or (to8(sr) shl 16) or (to8(sg) shl 8) or to8(sb)
+                    } else {
+                        out[oo + x] = (to8(av) shl 24) or (ColorConvert.linearToSrgb8(r) shl 16) or
+                            (ColorConvert.linearToSrgb8(g) shl 8) or ColorConvert.linearToSrgb8(bb)
+                    }
+                }
+            }
+        }
+
         fun finalize(a: Int, b: Int) {
             if (a >= b) return
-            val chunks = (b - a + 31) / 32
-            parallelFor(executor, chunks) { k ->
-                val y0 = a + k * 32
-                val y1 = minOf(b, y0 + 32)
-                val rows: Array<FloatArray> = if (epf != null) {
-                    Filters.epfBand(inputRow, y0, y1, w, h, epfHalo, epfSteps, epfRadius, epf, epfSigma, bw)
-                } else {
-                    Array(3) { c -> FloatArray((y1 - y0) * w).also { arr -> for (y in y0 until y1) inputRow(c, y, arr, (y - y0) * w) } }
-                }
-                lfGlobal.patches?.let { applyPatchesToBand(it, rows, y0, y1, w, h) }
-                val rx = rows[0]
-                val ry = rows[1]
-                val rb = rows[2]
-                for (y in y0 until y1) {
-                    val ro = (y - y0) * w
-                    val oo = y * w
-                    for (x in 0 until w) {
-                        val i = ro + x
-                        val gl = ry[i] + rx[i] - cb0
-                        val gm = ry[i] - rx[i] - cb1
-                        val gs = rb[i] - cb2
-                        val ml = (gl * gl * gl + ob[0]) * its
-                        val mm = (gm * gm * gm + ob[1]) * its
-                        val ms = (gs * gs * gs + ob[2]) * its
-                        var r = m[0] * ml + m[1] * mm + m[2] * ms
-                        var g = m[3] * ml + m[4] * mm + m[5] * ms
-                        var bb = m[6] * ml + m[7] * mm + m[8] * ms
-                        if (grey) {
-                            val l = 0.2126f * r + 0.7152f * g + 0.0722f * bb
-                            r = l; g = l; bb = l
-                        }
-                        var av = 1f
-                        if (alpha != null) {
-                            val raw = alpha.data[oo + x]
-                            av = if (alphaDepth!!.isFloat) alphaDepth.parseFloatSample(raw) else raw * alphaScale
-                            if (av < 0f) av = 0f else if (av > 1f) av = 1f
-                        }
-                        if (premul) {
-                            var sr = ColorConvert.srgbEncodeFast(r)
-                            var sg = ColorConvert.srgbEncodeFast(g)
-                            var sb = ColorConvert.srgbEncodeFast(bb)
-                            if (av > 0f) {
-                                sr /= av; sg /= av; sb /= av
-                            }
-                            out[oo + x] = (to8(av) shl 24) or (to8(sr) shl 16) or (to8(sg) shl 8) or to8(sb)
-                        } else {
-                            out[oo + x] = (to8(av) shl 24) or (ColorConvert.linearToSrgb8(r) shl 16) or
-                                (ColorConvert.linearToSrgb8(g) shl 8) or ColorConvert.linearToSrgb8(bb)
-                        }
+            // スレッドごとに連続した行をまとめて受け持ち、その中を最大 BAND 行の帯に分ける
+            val tasks = maxOf(1, minOf(threads, (b - a + 15) / 16))
+            val per = (b - a + tasks - 1) / tasks
+            parallelFor(executor, tasks) { k ->
+                val sc = scratchPool.poll() ?: Filters.EpfScratch()
+                try {
+                    val ta = a + k * per
+                    val tb = minOf(b, ta + per)
+                    var y0 = ta
+                    while (y0 < tb) {
+                        val y1 = minOf(tb, y0 + BAND)
+                        finalizeBand(y0, y1, sc)
+                        y0 = y1
                     }
+                } finally {
+                    scratchPool.offer(sc)
                 }
             }
         }
@@ -1136,11 +1188,14 @@ internal class FrameDecoder(
         var finalized = 0
         val rowsOfGroups = header.groupsPerColumn
         for (gy in 0 until rowsOfGroups) {
-            val target = bufs[gy % 2]
-            parallelFor(executor, header.groupsPerRow) { gx ->
-                decodeGroup(gy * header.groupsPerRow + gx, target, gy * gd)
+            if (gy > 0) {
+                // 前のグループ行の終わりの carryRows 行を残してから、同じ領域に次の行を復号する
+                for (c in 0 until 3) System.arraycopy(cur[c], (gd - carryRows) * stride, carry[c], 0, carryRows * stride)
+                curY0 = gy * gd
             }
-            gyDecoded = gy
+            parallelFor(executor, header.groupsPerRow) { gx ->
+                decodeGroup(gy * header.groupsPerRow + gx, cur, gy * gd)
+            }
             // 次のグループ行が要らない行まで仕上げる
             val ready = if (gy == rowsOfGroups - 1) h else minOf(h, (gy + 1) * gd - halo - 1)
             finalize(finalized, ready)
@@ -1150,7 +1205,7 @@ internal class FrameDecoder(
     }
 
     /** 行 y0..y1 の帯にパッチを重ねる (追加チャンネルのない画像) */
-    private fun applyPatchesToBand(patches: Patches, rows: Array<FloatArray>, y0: Int, y1: Int, w: Int, h: Int) {
+    private fun applyPatchesToBand(patches: Patches, rows: Array<FloatArray>, rs: Int, lo: Int, y0: Int, y1: Int, w: Int, h: Int) {
         for (p in patches.refs) {
             val ref = refs[p.refIdx]?.image ?: fail("patch reference not available")
             if (ref.color.size != 3) fail("patch reference channel mismatch")
@@ -1176,7 +1231,7 @@ internal class FrameDecoder(
                 for (c in 0 until 3) {
                     Features.blend(
                         mode, bi.clamp, bi.mode == 5 || bi.mode == 7, false,
-                        rows[c], w, tx0, ty0 - y0, null,
+                        rows[c], rs, tx0 + 3, ty0 - lo, null,
                         ref.color[c], ref.width, rx0, ry0, null,
                         tx1 - tx0, ty1 - ty0,
                     )
@@ -1200,6 +1255,9 @@ internal class FrameDecoder(
 
     companion object {
         val TIMING = System.getenv("JXL_TIMING") != null
+
+        /** 逐次描画で一度に仕上げる帯の最大の行数 (大きいほど EPF の重なりの再計算が減る) */
+        private const val BAND = 64
 
         fun to8(v: Float): Int {
             val f = v * 255f + 0.5f
