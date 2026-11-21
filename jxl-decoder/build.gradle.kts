@@ -44,3 +44,36 @@ publishing {
     }
 }
 
+
+// GitHub のリリースを Ivy リポジトリとして使うための ivy-<version>.xml (CI がリリースに添付する)。
+// jar だけだと Gradle は HEAD で存在を確かめるが、GitHub のリリースの転送先は HEAD で失敗することがあるので、
+// まずこのファイルを GET で読ませる
+val ivyDescriptor by tasks.registering {
+    val version = project.version.toString()
+    val kotlinVersion = org.jetbrains.kotlin.gradle.plugin.getKotlinPluginVersion(logger)
+    val out = layout.buildDirectory.file("ivy/ivy-$version.xml")
+    inputs.property("version", version)
+    inputs.property("kotlinVersion", kotlinVersion)
+    outputs.file(out)
+    doLast {
+        out.get().asFile.writeText(
+            """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <ivy-module version="2.0" xmlns:m="http://ant.apache.org/ivy/maven">
+              <info organisation="io.github.hamtit" module="jxl-decoder" revision="$version" status="release"/>
+              <configurations>
+                <conf name="default"/>
+                <conf name="sources"/>
+              </configurations>
+              <publications>
+                <artifact name="jxl-decoder" type="jar" ext="jar" conf="default"/>
+                <artifact name="jxl-decoder" type="source" ext="jar" conf="sources" m:classifier="sources"/>
+              </publications>
+              <dependencies>
+                <dependency org="org.jetbrains.kotlin" name="kotlin-stdlib" rev="$kotlinVersion" conf="default->default"/>
+              </dependencies>
+            </ivy-module>
+            """.trimIndent() + "\n",
+        )
+    }
+}
