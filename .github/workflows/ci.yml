@@ -134,7 +134,7 @@ jobs:
         env:
           VERSION: ${{ needs.config.outputs.version }}
         run: |
-          ./gradlew --no-daemon :jxl-decoder:jar :jxl-decoder:sourcesJar :jxl-decoder:ivyDescriptor :cli:installDist
+          ./gradlew --no-daemon :jxl-decoder:jar :jxl-decoder:sourcesJar :cli:installDist
           mkdir -p dist work
           cp "jxl-decoder/build/libs/jxl-decoder-${VERSION}.jar" "jxl-decoder/build/libs/jxl-decoder-${VERSION}-sources.jar" dist/
           for jar in dist/*.jar; do
@@ -151,16 +151,7 @@ jobs:
           fixtures=jxl-decoder/src/test/resources/fixtures
           cli/build/install/cli/bin/cli compare "$fixtures/lossless_e7.jxl" "$fixtures/lossless_e7.0.png" | tee compare.log
           grep -q 'max error 0$' compare.log
-          # Ivy descriptor that lets Gradle use the release as a repository with GET requests only
-          cp "jxl-decoder/build/ivy/ivy-${VERSION}.xml" dist/
-          python3 - "dist/ivy-${VERSION}.xml" "$VERSION" <<'PY'
-          import sys
-          import xml.etree.ElementTree as ET
-
-          info = ET.parse(sys.argv[1]).getroot().find("info")
-          assert info.get("module") == "jxl-decoder" and info.get("revision") == sys.argv[2], info.attrib
-          PY
-          (cd dist && sha256sum *.jar *.xml > SHA256SUMS)
+          (cd dist && sha256sum *.jar > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
           name: packages
@@ -190,8 +181,7 @@ jobs:
 
           - \`jxl-decoder-${VERSION}.jar\`: the library (Java 17 bytecode, depends only on the Kotlin standard library).
           - \`jxl-decoder-${VERSION}-sources.jar\`: sources.
-          - \`ivy-${VERSION}.xml\`: Ivy descriptor, so that Gradle can use the releases as a repository.
-          - \`SHA256SUMS\`: SHA-256 checksums of the files.
+          - \`SHA256SUMS\`: SHA-256 checksums of the jars.
 
           Gradle: \`implementation("io.github.hamtit:jxl-decoder:${VERSION}")\` with this repository's releases as an ivy repository (see README).
 
@@ -205,4 +195,4 @@ jobs:
           fi
           gh release create "$TAG" "${target[@]}" \
             --title "jxl-decoder ${VERSION}" --notes-file notes.md \
-            dist/*.jar dist/*.xml dist/SHA256SUMS
+            dist/*.jar dist/SHA256SUMS

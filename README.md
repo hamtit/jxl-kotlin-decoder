@@ -30,18 +30,15 @@ decoder.rewind()                           // 最初から読み直す (ルー�
 
 ## 依存関係への追加
 
-[リリース](https://github.com/hamtit/jxl-kotlin-decoder/releases) に jar を添付しています。Gradle なら、リリースに添付した `ivy-<バージョン>.xml` を使って Ivy リポジトリとしてリリースから直接取れます (依存する Kotlin 標準ライブラリは Maven Central から取られます)。0.1.0 には `ivy-<バージョン>.xml` が無いので、0.1.1 以降を使ってください。
+[リリース](https://github.com/hamtit/jxl-kotlin-decoder/releases) に jar を添付しています。Gradle なら ivy リポジトリとしてリリースから直接取れます (Kotlin 標準ライブラリ以外の依存はありません)。
 
 ```kotlin
 // settings.gradle.kts
 dependencyResolutionManagement {
     repositories {
         ivy("https://github.com/hamtit/jxl-kotlin-decoder/releases/download") {
-            patternLayout {
-                ivy("v[revision]/ivy-[revision].xml")
-                artifact("v[revision]/[artifact]-[revision](-[classifier]).[ext]")
-            }
-            metadataSources { ivyDescriptor() }
+            patternLayout { artifact("v[revision]/[artifact]-[revision](-[classifier]).[ext]") }
+            metadataSources { artifact() }
             content { includeModule("io.github.hamtit", "jxl-decoder") }
         }
     }
