@@ -21,8 +21,18 @@ internal class BitReader(private val data: ByteArray, private val start: Int, pr
 
     val totalBits: Long get() = (end - start).toLong() * 8
 
+    private val view: java.nio.ByteBuffer = java.nio.ByteBuffer.wrap(data).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+
     private fun refill() {
         val n = (63 - bits) ushr 3
+        if (pos + 8 <= end) {
+            // 8 バイトまとめて読む。buf の有効なビットより上には次のバイトのビットが入るが、
+            // 次の補充で同じ位置に同じビットを OR するので壊れない
+            buf = buf or (view.getLong(pos) shl bits)
+            pos += n
+            bits += n shl 3
+            return
+        }
         if (pos + n <= end) {
             val d = data
             var p = pos

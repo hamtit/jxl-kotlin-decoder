@@ -2,6 +2,12 @@ package io.github.hamtit.jxl
 
 import java.util.concurrent.ExecutorService
 
+/** 帯の処理に入力の行を渡す (Kotlin の関数型だと Int がボックス化されるので専用の型にする) */
+internal fun interface RowSource {
+    /** チャンネル c の画像の行 y (範囲外なら鏡映した行) を dst[off until off + w] に書く */
+    fun row(c: Int, y: Int, dst: FloatArray, off: Int)
+}
+
 internal object Filters {
 
     /** 境界を鏡映した添字 (-1 -> 0, -2 -> 1, len -> len-1) */
@@ -68,6 +74,36 @@ internal object Filters {
         return colors
     }
 
+    /**
+     * Gaborish を 1 行分計算する。src の行 up・mid・dn (行の先頭の添字) から dst[off until off + w] に書く。
+     * 左右の端は端の画素を繰り返す
+     */
+    fun gaborishRow(src: FloatArray, up: Int, mid: Int, dn: Int, dst: FloatArray, off: Int, w: Int, w0: Float, w1: Float) {
+        val norm = 1f / (1f + 4f * w0 + 4f * w1)
+        if (w == 1) {
+            val side = src[up] + src[dn] + 2f * src[mid]
+            val diag = 2f * (src[up] + src[dn])
+            dst[off] = (src[mid] + side * w0 + diag * w1) * norm
+            return
+        }
+        run {
+            val side = src[up] + src[dn] + src[mid] + src[mid + 1]
+            val diag = src[up] + src[up + 1] + src[dn] + src[dn + 1]
+            dst[off] = (src[mid] + side * w0 + diag * w1) * norm
+        }
+        for (x in 1 until w - 1) {
+            val side = src[up + x] + src[dn + x] + src[mid + x - 1] + src[mid + x + 1]
+            val diag = src[up + x - 1] + src[up + x + 1] + src[dn + x - 1] + src[dn + x + 1]
+            dst[off + x] = (src[mid + x] + side * w0 + diag * w1) * norm
+        }
+        run {
+            val x = w - 1
+            val side = src[up + x] + src[dn + x] + src[mid + x - 1] + src[mid + x]
+            val diag = src[up + x - 1] + src[up + x] + src[dn + x - 1] + src[dn + x]
+            dst[off + x] = (src[mid + x] + side * w0 + diag * w1) * norm
+        }
+    }
+
     private val KERNEL0 = intArrayOf(0, -2, -1, -1, 0, -1, 1, -1, -2, 0, -1, 0, 1, 0, 2, 0, -1, 1, 0, 1, 1, 1, 0, 2)
     private val DIST0 = intArrayOf(0, -1, 1, 0, 0, 0, -1, 0, 0, 1)
 
@@ -110,18 +146,21 @@ internal object Filters {
             val ys = minOf(h, s * bandsPerStripe * band)
             val ye = minOf(h, (s + 1) * bandsPerStripe * band)
             val sv = saved[s]
-            fun inputRow(c: Int, y: Int, dst: FloatArray, off: Int) {
+            val inputRow = RowSource { c, y, dst, off ->
                 if (y < ys) System.arraycopy(sv[c], (y - (ys - halo)) * w, dst, off, w)
                 else if (y >= ye) System.arraycopy(sv[c], (halo + y - ye) * w, dst, off, w)
                 else System.arraycopy(planes[c], y * w, dst, off, w)
             }
+            val scratch = Scratch()
             var pending: Array<FloatArray>? = null
             var pendingY0 = 0
             var pendingY1 = 0
             var y0 = ys
+            var outSlot = EPF_OUT_A
             while (y0 < ye) {
                 val y1 = minOf(ye, y0 + band)
-                val out = epfBand(::inputRow, y0, y1, w, h, halo, steps, radius, params, sigma, sigmaStride)
+                val out = epfBand(inputRow, y0, y1, w, h, halo, steps, radius, params, sigma, sigmaStride, scratch, outSlot)
+                outSlot = if (outSlot == EPF_OUT_A) EPF_OUT_B else EPF_OUT_A
                 // 前の帯の結果は、この帯の入力を読み終えてから書き戻す
                 pending?.let { p -> for (c in 0 until 3) System.arraycopy(p[c], 0, planes[c], pendingY0 * w, (pendingY1 - pendingY0) * w) }
                 pending = out
@@ -134,20 +173,29 @@ internal object Filters {
         return colors
     }
 
-    /** 帯 (行 y0..y1) の全段階を計算する。結果は行の長さ w の 3 平面 */
+    /** epfBand の結果を置く [Scratch] の枠 (2 組) */
+    const val EPF_OUT_A = 10
+    const val EPF_OUT_B = 13
+
+    /**
+     * 帯 (行 y0..y1) の全段階を計算する。結果は行の長さ w の 3 平面で、[scratch] の枠 outSlot から 3 つを使う
+     * (配列は要求より長いことがある)
+     */
     fun epfBand(
-        inputRow: (Int, Int, FloatArray, Int) -> Unit,
+        inputRow: RowSource,
         y0: Int, y1: Int, w: Int, h: Int, halo: Int, steps: IntArray, radius: IntArray,
-        params: EpfParams, sigma: FloatArray?, sigmaStride: Int,
+        params: EpfParams, sigma: FloatArray?, sigmaStride: Int, scratch: Scratch, outSlot: Int,
     ): Array<FloatArray> {
         val pw = w + 6
         var lo = y0 - halo
         var hi = y1 + halo
-        var cur = Array(3) { FloatArray((hi - lo) * pw) }
+        // 枠 0..2 と 3..5 を交互に入出力に使う
+        var curSlot = 0
+        var cur = Array(3) { scratch.floats(curSlot + it, (hi - lo) * pw) }
         for (c in 0 until 3) {
             for (y in lo until hi) {
                 val row = (y - lo) * pw
-                inputRow(c, y, cur[c], row + 3)
+                inputRow.row(c, y, cur[c], row + 3)
                 padRow(cur[c], row, w)
             }
         }
@@ -155,11 +203,12 @@ internal object Filters {
             val r = radius[k]
             val nlo = lo + r
             val nhi = hi - r
-            val next = Array(3) { FloatArray((nhi - nlo) * pw) }
+            val nextSlot = 3 - curSlot
+            val next = Array(3) { scratch.floats(nextSlot + it, (nhi - nlo) * pw) }
             val ya = maxOf(nlo, 0)
             val yb = minOf(nhi, h)
             if (step == 0) epfStep0(cur, lo, next, nlo, ya, yb, w, params, sigma, sigmaStride)
-            else epfStep12(cur, lo, next, nlo, ya, yb, w, params, sigma, sigmaStride, step)
+            else epfStep12(cur, lo, hi - lo, next, nlo, ya, yb, w, params, sigma, sigmaStride, step, scratch)
             // 画像の外の行は、計算した行を鏡映して埋める
             for (y in nlo until nhi) {
                 if (y in ya until yb) continue
@@ -167,11 +216,12 @@ internal object Filters {
                 for (c in 0 until 3) System.arraycopy(next[c], (sy - nlo) * pw, next[c], (y - nlo) * pw, pw)
             }
             cur = next
+            curSlot = nextSlot
             lo = nlo
             hi = nhi
         }
         return Array(3) { c ->
-            val o = FloatArray((y1 - y0) * w)
+            val o = scratch.floats(outSlot + c, (y1 - y0) * w)
             for (y in y0 until y1) System.arraycopy(cur[c], (y - lo) * pw + 3, o, (y - y0) * w, w)
             o
         }
@@ -193,8 +243,8 @@ internal object Filters {
      * 隣の画素との重み付き差分 H (右)・V (下) を先に求め、距離はその和で表す。
      */
     private fun epfStep12(
-        inp: Array<FloatArray>, inLo: Int, out: Array<FloatArray>, outLo: Int, ya: Int, yb: Int, w: Int,
-        params: EpfParams, sigma: FloatArray?, sigmaStride: Int, step: Int,
+        inp: Array<FloatArray>, inLo: Int, inRows: Int, out: Array<FloatArray>, outLo: Int, ya: Int, yb: Int, w: Int,
+        params: EpfParams, sigma: FloatArray?, sigmaStride: Int, step: Int, scratch: Scratch,
     ) {
         val pw = w + 6
         val stepMul = if (step == 2) params.pass2SigmaScale else 1f
@@ -211,20 +261,26 @@ internal object Filters {
         val plus = step == 1
         // 差分は画像の行 ya-2 .. yb+1 について計算する (局所行 0 = ya-2)
         val rows = (yb - ya) + 4
-        val hd = FloatArray(rows * pw)
-        val vd = FloatArray(rows * pw)
-        val inRows = inp[0].size / pw
+        val hd = scratch.floats(6, rows * pw)
+        val vd = scratch.floats(7, rows * pw)
         for (r in 0 until rows) {
             val iy = ya - 2 + r - inLo
-            if (iy < 0 || iy >= inRows) continue
-            val base = iy * pw
             val lb = r * pw
+            if (iy < 0 || iy >= inRows) {
+                java.util.Arrays.fill(hd, lb, lb + pw, 0f)
+                java.util.Arrays.fill(vd, lb, lb + pw, 0f)
+                continue
+            }
+            val base = iy * pw
+            hd[lb + pw - 1] = 0f
             for (x in 0 until pw - 1) {
                 val i = base + x
                 hd[lb + x] = s0 * kotlin.math.abs(i0[i + 1] - i0[i]) + s1 * kotlin.math.abs(i1[i + 1] - i1[i]) +
                     s2 * kotlin.math.abs(i2[i + 1] - i2[i])
             }
-            if (iy + 1 < inRows) {
+            if (iy + 1 >= inRows) {
+                java.util.Arrays.fill(vd, lb, lb + pw, 0f)
+            } else {
                 for (x in 0 until pw) {
                     val i = base + x
                     vd[lb + x] = s0 * kotlin.math.abs(i0[i + pw] - i0[i]) + s1 * kotlin.math.abs(i1[i + pw] - i1[i]) +
@@ -235,8 +291,9 @@ internal object Filters {
         var sh = hd
         var sv = vd
         if (plus) {
-            sh = FloatArray(rows * pw)
-            sv = FloatArray(rows * pw)
+            // 読むのは行 1..rows-2・列 1..pw-3 だけ (それ以外は書かない)
+            sh = scratch.floats(8, rows * pw)
+            sv = scratch.floats(9, rows * pw)
             for (r in 1 until rows - 1) {
                 val lb = r * pw
                 for (x in 1 until pw - 2) {

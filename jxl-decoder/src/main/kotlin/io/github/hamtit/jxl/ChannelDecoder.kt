@@ -76,23 +76,38 @@ internal object ChannelDecoder {
         for (y in 0 until height) {
             val row = y * width
             var prevGrad = 0
+            // 端から 2 画素以上内側なら近傍は全て画像の中にある
+            val interiorRow = y >= 2
+            val xEnd = width - 2
             for (x in 0 until width) {
                 val i = row + x
                 val w: Int
                 val n: Int
                 val nw: Int
-                if (y == 0) {
-                    w = if (x > 0) out[i - 1] else 0
-                    n = w
-                    nw = w
-                } else {
+                val ne: Int
+                val nn: Int
+                val ww: Int
+                if (interiorRow && x >= 2 && x < xEnd) {
+                    w = out[i - 1]
                     n = out[i - width]
-                    w = if (x > 0) out[i - 1] else n
-                    nw = if (x > 0) out[i - width - 1] else n
+                    nw = out[i - width - 1]
+                    ne = out[i - width + 1]
+                    nn = out[i - 2 * width]
+                    ww = out[i - 2]
+                } else {
+                    if (y == 0) {
+                        w = if (x > 0) out[i - 1] else 0
+                        n = w
+                        nw = w
+                    } else {
+                        n = out[i - width]
+                        w = if (x > 0) out[i - 1] else n
+                        nw = if (x > 0) out[i - width - 1] else n
+                    }
+                    ne = if (y > 0 && x + 1 < width) out[i - width + 1] else n
+                    nn = if (y > 1) out[i - 2 * width] else n
+                    ww = if (x > 1) out[i - 2] else w
                 }
-                val ne = if (y > 0 && x + 1 < width) out[i - width + 1] else n
-                val nn = if (y > 1) out[i - 2 * width] else n
-                val ww = if (x > 1) out[i - 2] else w
                 wp?.predict(n, nw, ne, w, nn)
 
                 // 木をたどる

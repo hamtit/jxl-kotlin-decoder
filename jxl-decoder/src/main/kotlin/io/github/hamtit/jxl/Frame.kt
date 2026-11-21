@@ -96,6 +96,8 @@ internal class FrameDecoder(
     private val noiseSeed: Long,
 ) {
     private val numLf = header.numLfGroups
+    /** グループ・帯の処理で使い回す作業用の配列 */
+    private val scratchPool = ScratchPool()
     private val numGroups = header.numGroups
     private var sharedReader: BitReader? = null
 
@@ -224,10 +226,17 @@ internal class FrameDecoder(
             parallelFor(executor, numGroups) { g -> decodeGroup(g, null, 0) }
         }
         if (toc.singleEntry) sharedReader?.checkOverrun()
+        // ここから先は画像全体の平面を扱うので、グループ用の作業配列は手放す
+        scratchPool.free.clear()
 
         phase("groups")
         val modularChannels = lfGlobal.gmodular?.finish()
         phase("modularFinish")
+        if (stream != null && modularChannels != null && canWriteModularDirect(modularChannels)) {
+            stream.pixels = modularToArgb(modularChannels)
+            phase("toArgb")
+            return null
+        }
         return render(modularChannels)
     }
 
@@ -601,6 +610,10 @@ internal class FrameDecoder(
 
     /** グループを復号する。target が null なら colorPlanes に、そうでなければ行 targetY0 から始まる帯に書く */
     private fun decodeGroup(g: Int, target: Array<FloatArray>?, targetY0: Int) {
+        scratchPool.use { decodeGroup(g, target, targetY0, it) }
+    }
+
+    private fun decodeGroup(g: Int, target: Array<FloatArray>?, targetY0: Int, scratch: Scratch) {
         val gx = g % header.groupsPerRow
         val gy = g / header.groupsPerRow
         val vardct = !header.isModular
@@ -610,7 +623,8 @@ internal class FrameDecoder(
         if (vardct) {
             gbw = minOf(gd / 8, bw - gx * (gd / 8))
             gbh = minOf(gd / 8, bh - gy * (gd / 8))
-            coeffs = Array(3) { c -> IntArray(((gbw shr hShift[c]) * 8) * ((gbh shr vShift[c]) * 8)) }
+            // 係数は 0 で始める (使い回す配列は reconstructGroup が読んだところを 0 に戻している)
+            coeffs = Array(3) { c -> scratch.ints(c, ((gbw shr hShift[c]) * 8) * ((gbh shr vShift[c]) * 8)) }
         }
         for (p in 0 until header.passes.numPasses) {
             val br = passGroupSection(p, g)
@@ -620,7 +634,7 @@ internal class FrameDecoder(
             decodeModularGroup(br, parts, 1 + 3 * numLf + 17 + p * numGroups + g)
             if (!toc.singleEntry) br.checkOverrun()
         }
-        if (vardct) reconstructGroup(gx, gy, gbw, gbh, coeffs!!, target, targetY0)
+        if (vardct) reconstructGroup(gx, gy, gbw, gbh, coeffs!!, target, targetY0, scratch)
     }
 
     private fun decodeHfCoefficients(br: BitReader, pass: Int, gx: Int, gy: Int, gbw: Int, gbh: Int, out: Array<IntArray>) {
@@ -743,6 +757,7 @@ internal class FrameDecoder(
     /** 逆量子化・CfL・逆 DCT をして色平面に書き込む */
     private fun reconstructGroup(
         gx: Int, gy: Int, gbw: Int, gbh: Int, coeffs: Array<IntArray>, target: Array<FloatArray>?, targetY0: Int,
+        scratch: Scratch,
     ) {
         val qm = quantMatrices!!
         val bx0 = gx * (gd / 8)
@@ -751,7 +766,10 @@ internal class FrameDecoder(
             Math.pow(0.8, (header.xQmScale - 2).toDouble()).toFloat(), 1f,
             Math.pow(0.8, (header.bQmScale - 2).toDouble()).toFloat(),
         )
-        val fcoeff = Array(3) { c -> FloatArray(coeffs[c].size) }
+        val fcoeff = Array(3) { c ->
+            val n = ((gbw shr hShift[c]) * 8) * ((gbh shr vShift[c]) * 8)
+            scratch.floats(16 + c, n).also { java.util.Arrays.fill(it, 0, n, 0f) }
+        }
         val qb = image.quantBias
         val qbn = image.quantBiasNumerator
         for (c in 0 until 3) {
@@ -769,6 +787,7 @@ internal class FrameDecoder(
                     for (xx in 0 until bwv) {
                         val q = src[row + xx]
                         if (q == 0) continue
+                        src[row + xx] = 0
                         val qf = q.toFloat()
                         val v = if (q == 1 || q == -1) qf * qb[c] else qf - qbn / qf
                         dst[row + xx] = v * m[mrow + xx] * scale
@@ -803,9 +822,9 @@ internal class FrameDecoder(
             }
         }
         // 逆変換
-        val scratch = FloatArray(512)
-        val tmp = FloatArray(64)
-        val lfBuf = FloatArray(32 * 32)
+        val dctScratch = scratch.floats(19, 512)
+        val tmp = scratch.floats(20, 64)
+        val lfBuf = scratch.floats(21, 32 * 32)
         for (c in 0 until 3) {
             val cw = (gbw shr hShift[c]) * 8
             val buf = fcoeff[c]
@@ -822,7 +841,7 @@ internal class FrameDecoder(
                     for (y in 0 until bhb) for (x in 0 until bwb) {
                         lfBuf[y * bwb + x] = lf.data[(lby0 + sy + y) * lf.width + lbx0 + sx + x]
                     }
-                    Dct.dct2d(lfBuf, 0, bwb, bwb, bhb, scratch, true)
+                    Dct.dct2d(lfBuf, 0, bwb, bwb, bhb, dctScratch, true)
                     val logbw = Integer.numberOfTrailingZeros(bwb)
                     val logbh = Integer.numberOfTrailingZeros(bhb)
                     for (y in 0 until bhb) for (x in 0 until bwb) {
@@ -836,7 +855,7 @@ internal class FrameDecoder(
                     Tt.DCT4X8 -> Dct.dct4x8(buf, base, cw, false)
                     Tt.DCT8X4 -> Dct.dct4x8(buf, base, cw, true)
                     in Tt.AFV0..Tt.AFV3 -> Dct.afv(buf, base, cw, t - Tt.AFV0)
-                    else -> Dct.dct2d(buf, base, cw, bwb * 8, bhb * 8, scratch, false)
+                    else -> Dct.dct2d(buf, base, cw, bwb * 8, bhb * 8, dctScratch, false)
                 }
             }
             // 色平面へ
@@ -990,6 +1009,69 @@ internal class FrameDecoder(
         return FrameImage(header, fw, fh, outColor, outExtra, img.colorTransformPending)
     }
 
+    // ---------------- Modular から直接 ARGB へ ----------------
+
+    /**
+     * 整数のサンプルをそのまま 8 ビットにすればよいか (sRGB の可逆画像など)。
+     * そうなら浮動小数点の平面を作らずに [modularToArgb] で書き出せる
+     */
+    private fun canWriteModularDirect(chans: List<Channel>): Boolean {
+        if (!header.isModular || image.xybEncoded || header.doYCbCr || header.upsampling != 1) return false
+        if (header.gabor != null || header.epf != null) return false
+        if (header.hasPatches || header.hasSplines || header.hasNoise) return false
+        // ColorConvert.toSrgb が何もしない色空間だけ
+        val enc = image.colourEncoding
+        if (!enc.wantIcc) {
+            if (enc.transferFunction != TransferFunction.SRGB) return false
+            if (enc.colourSpace == ColourSpace.RGB && (!enc.isSrgbPrimaries || !enc.isD65)) return false
+        }
+        val colorCount = header.encodedColorChannels
+        if (colorCount != 1 && colorCount != 3) return false
+        if (chans.size != colorCount + image.extraChannels.size) return false
+        if (image.bitDepth.isFloat) return false
+        for (c in 0 until colorCount) if (chans[c].width != colorW || chans[c].height != colorH) return false
+        val alphaIdx = image.alphaChannel
+        if (alphaIdx >= 0) {
+            if (header.ecUpsampling[alphaIdx] != 1 || image.extraChannels[alphaIdx].dimShift != 0) return false
+            if (image.extraChannels[alphaIdx].bitDepth.isFloat) return false
+            val a = chans[colorCount + alphaIdx]
+            if (a.width != colorW || a.height != colorH) return false
+        }
+        return true
+    }
+
+    /** Modular の整数チャンネルから ARGB を作る (JxlDecoder.toOutput と同じ計算) */
+    private fun modularToArgb(chans: List<Channel>): IntArray {
+        val n = colorW * colorH
+        val colorCount = header.encodedColorChannels
+        val r = chans[0].data
+        val g = chans[if (colorCount == 3) 1 else 0].data
+        val b = chans[if (colorCount == 3) 2 else 0].data
+        val alphaIdx = image.alphaChannel
+        val alpha = if (alphaIdx >= 0) chans[colorCount + alphaIdx].data else null
+        val premul = alphaIdx >= 0 && image.extraChannels[alphaIdx].alphaAssociated
+        val s = image.bitDepth.scale()
+        val sa = if (alphaIdx >= 0) image.extraChannels[alphaIdx].bitDepth.scale() else 0f
+        // 最初の色チャンネルの配列を出力に使い回す (同じ添字を読んでから書くので壊れない)。
+        // 他のチャンネルと配列を共有していれば新しく作る
+        val reuse = r.size == n && chans.indices.none { it != 0 && chans[it].data === r }
+        val out = if (reuse) r else IntArray(n)
+        parallelRows(executor, colorH) { y0, y1 ->
+            for (i in y0 * colorW until y1 * colorW) {
+                var a = 1f
+                if (alpha != null) a = (alpha[i] * sa).coerceIn(0f, 1f)
+                var rv = r[i] * s
+                var gv = g[i] * s
+                var bv = b[i] * s
+                if (premul && a > 0f) {
+                    rv /= a; gv /= a; bv /= a
+                }
+                out[i] = (to8(a) shl 24) or (to8(rv) shl 16) or (to8(gv) shl 8) or to8(bv)
+            }
+        }
+        return out
+    }
+
     // ---------------- 逐次描画 ----------------
 
     /** グループの行ごとに描画できるか (XYB の静止画で、フレーム全体が必要な処理がない) */
@@ -1014,7 +1096,6 @@ internal class FrameDecoder(
         val w = colorW
         val h = colorH
         val stride = bw * 8
-        val bufs = Array(2) { Array(3) { FloatArray(stride * gd) } }
         val out = IntArray(Plane.checkedSize(w, h))
         val gab = header.gabor
         val epf = header.epf
@@ -1027,44 +1108,34 @@ internal class FrameDecoder(
         val epfRadius = IntArray(epfSteps.size) { when (epfSteps[it]) { 0 -> 3; 1 -> 2; else -> 1 } }
         val epfHalo = epfRadius.sum()
         val halo = epfHalo + (if (gab != null) 1 else 0)
+        // 逆 DCT の結果を置く帯。先頭の tail 行に前のグループ行の末尾 (まだ仕上げていない行の計算に要る分) を残し、
+        // その後ろにグループ 1 行分を復号する。グループ行 gy を復号した後、帯は画像の行 gy * gd - tail から始まる
+        val tail = 2 * halo + 2
+        val buf = Array(3) { FloatArray((tail + gd) * stride) }
         val alphaIdx = image.alphaChannel
         val alpha = if (alphaIdx >= 0) lfGlobal.gmodular?.channels?.get(alphaIdx) else null
         val alphaDepth = if (alphaIdx >= 0) image.extraChannels[alphaIdx].bitDepth else null
         val premul = alphaIdx >= 0 && image.extraChannels[alphaIdx].alphaAssociated
-        var gyDecoded = -1
+        var bufY0 = -tail
 
-        // 画像の行 y (範囲内) の逆 DCT 後の値
-        fun idctRow(c: Int, y: Int): FloatArray {
-            val gy = y / gd
-            if (gy != gyDecoded && gy != gyDecoded - 1) error("row not available")
-            return bufs[gy % 2][c]
+        // 画像の行 y (範囲内) が buf のどこにあるか
+        fun idctOff(y: Int): Int {
+            val r = y - bufY0
+            if (r < 0 || r >= tail + gd) error("row not available")
+            return r * stride
         }
-        fun idctOff(y: Int) = (y % gd) * stride
 
         // Gaborish 後の行 (y は鏡映済みでなくてよい)
-        val inputRow: (Int, Int, FloatArray, Int) -> Unit = { c, yy, dst, off ->
+        val inputRow = RowSource { c, yy, dst, off ->
             val y = Filters.mirror(yy, h)
-            val src = idctRow(c, y)
+            val src = buf[c]
             val o = idctOff(y)
             if (gab == null) {
                 System.arraycopy(src, o, dst, off, w)
             } else {
-                val w0 = gab[2 * c]
-                val w1 = gab[2 * c + 1]
-                val norm = 1f / (1f + 4f * w0 + 4f * w1)
-                val yu = maxOf(y - 1, 0)
-                val yd = minOf(y + 1, h - 1)
-                val su = idctRow(c, yu)
-                val ou = idctOff(yu)
-                val sd = idctRow(c, yd)
-                val od = idctOff(yd)
-                for (x in 0 until w) {
-                    val xl = if (x > 0) x - 1 else 0
-                    val xr = if (x + 1 < w) x + 1 else w - 1
-                    val side = su[ou + x] + sd[od + x] + src[o + xl] + src[o + xr]
-                    val diag = su[ou + xl] + su[ou + xr] + sd[od + xl] + sd[od + xr]
-                    dst[off + x] = (src[o + x] + side * w0 + diag * w1) * norm
-                }
+                val ou = idctOff(maxOf(y - 1, 0))
+                val od = idctOff(minOf(y + 1, h - 1))
+                Filters.gaborishRow(src, ou, o, od, dst, off, w, gab[2 * c], gab[2 * c + 1])
             }
         }
 
@@ -1080,13 +1151,17 @@ internal class FrameDecoder(
         fun finalize(a: Int, b: Int) {
             if (a >= b) return
             val chunks = (b - a + 31) / 32
-            parallelFor(executor, chunks) { k ->
+            parallelFor(executor, chunks) { k -> scratchPool.use { scratch ->
                 val y0 = a + k * 32
                 val y1 = minOf(b, y0 + 32)
                 val rows: Array<FloatArray> = if (epf != null) {
-                    Filters.epfBand(inputRow, y0, y1, w, h, epfHalo, epfSteps, epfRadius, epf, epfSigma, bw)
+                    Filters.epfBand(inputRow, y0, y1, w, h, epfHalo, epfSteps, epfRadius, epf, epfSigma, bw, scratch, Filters.EPF_OUT_A)
                 } else {
-                    Array(3) { c -> FloatArray((y1 - y0) * w).also { arr -> for (y in y0 until y1) inputRow(c, y, arr, (y - y0) * w) } }
+                    Array(3) { c ->
+                        scratch.floats(Filters.EPF_OUT_A + c, (y1 - y0) * w).also { arr ->
+                            for (y in y0 until y1) inputRow.row(c, y, arr, (y - y0) * w)
+                        }
+                    }
                 }
                 lfGlobal.patches?.let { applyPatchesToBand(it, rows, y0, y1, w, h) }
                 val rx = rows[0]
@@ -1130,17 +1205,20 @@ internal class FrameDecoder(
                         }
                     }
                 }
-            }
+            } }
         }
 
         var finalized = 0
         val rowsOfGroups = header.groupsPerColumn
         for (gy in 0 until rowsOfGroups) {
-            val target = bufs[gy % 2]
-            parallelFor(executor, header.groupsPerRow) { gx ->
-                decodeGroup(gy * header.groupsPerRow + gx, target, gy * gd)
+            if (gy > 0) {
+                // 前のグループ行の末尾 tail 行を帯の先頭に移す
+                for (c in 0 until 3) System.arraycopy(buf[c], gd * stride, buf[c], 0, tail * stride)
             }
-            gyDecoded = gy
+            bufY0 = gy * gd - tail
+            parallelFor(executor, header.groupsPerRow) { gx ->
+                decodeGroup(gy * header.groupsPerRow + gx, buf, bufY0)
+            }
             // 次のグループ行が要らない行まで仕上げる
             val ready = if (gy == rowsOfGroups - 1) h else minOf(h, (gy + 1) * gd - halo - 1)
             finalize(finalized, ready)
