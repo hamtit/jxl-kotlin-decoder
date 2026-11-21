@@ -30,11 +30,22 @@ decoder.rewind()                           // 最初から読み直す (ルー�
 
 ## 依存関係への追加
 
-[JitPack](https://jitpack.io) でタグを指定して使えます。
+[リリース](https://github.com/hamtit/jxl-kotlin-decoder/releases) に jar を添付しています。Gradle なら ivy リポジトリとしてリリースから直接取れます (Kotlin 標準ライブラリ以外の依存はありません)。
 
 ```kotlin
-repositories { maven("https://jitpack.io") }
-dependencies { implementation("com.github.hamtit.jxl-kotlin-decoder:jxl-decoder:<タグ>") }
+// settings.gradle.kts
+dependencyResolutionManagement {
+    repositories {
+        ivy("https://github.com/hamtit/jxl-kotlin-decoder/releases/download") {
+            patternLayout { artifact("v[revision]/[artifact]-[revision](-[classifier]).[ext]") }
+            metadataSources { artifact() }
+            content { includeModule("io.github.hamtit", "jxl-decoder") }
+        }
+    }
+}
+
+// build.gradle.kts
+dependencies { implementation("io.github.hamtit:jxl-decoder:<バージョン>") }
 ```
 
 ソースから使う場合は、このリポジトリを clone して Gradle の composite build (`includeBuild`) で `:jxl-decoder` を参照してください。
@@ -97,7 +108,7 @@ cli/build/install/cli/bin/cli compare in.jxl ref.png   # PSNR と最大誤差
 
 ### バージョンとリリース
 
-バージョンは `gradle.properties` の `version` だけで決まります。上げて `main` にマージすると、CI (`.github/workflows/ci.yml`) が `v<version>` のタグと GitHub のリリース (jar・ソースの jar・SHA256SUMS) を作ります。JitPack はそのタグから配ります。同じバージョンのタグを手で push しても同じようにリリースされます (タグと `gradle.properties` が食い違うと失敗します)。
+バージョンは `gradle.properties` の `version` だけで決まります。上げて `main` にマージすると、CI (`.github/workflows/ci.yml`) が `v<version>` のタグと GitHub のリリース (jar・ソースの jar・SHA256SUMS) を作ります。同じバージョンのタグを手で push しても同じようにリリースされます (タグと `gradle.properties` が食い違うと失敗します)。
 
 CI は PR と `main` への push のたびに、警告をエラーにしたコンパイル、Linux x64・arm64 でのビルドとテスト、jar の中身 (ライセンス・Java 17 のクラス) と jar での復号の確認を行います。
 

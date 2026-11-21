@@ -1,5 +1,0 @@
-# JitPack は com.github.hamtit.jxl-kotlin-decoder:jxl-decoder:<タグ> で配る。座標をそれに合わせて mavenLocal に入れる
-jdk:
-  - openjdk17
-install:
-  - ./gradlew :jxl-decoder:publishToMavenLocal -x test -Pgroup=com.github.hamtit.jxl-kotlin-decoder -Pversion=$VERSION
