@@ -1117,7 +1117,34 @@ internal class FrameDecoder(
         val alphaScale = alphaDepth?.scale() ?: 0f
         val premul = alphaIdx >= 0 && image.extraChannels[alphaIdx].alphaAssociated
         val out = r
-        // 色・アルファは浮動小数点の経路 (channelToPlane → toOutput) と同じ計算にする
+        if (!premul && image.bitDepth.bitsPerSample == 8 &&
+            (alphaDepth == null || (!alphaDepth.isFloat && alphaDepth.bitsPerSample == 8))
+        ) {
+            // 8 ビット整数を正規化してから 8 ビットに丸め直すと、0..255 への切り詰めと同じになる
+            parallelRows(executor, colorH) { y0, y1 ->
+                for (i in y0 * colorW until y1 * colorW) {
+                    val rv = r[i]
+                    val gv = g[i]
+                    val bv = b[i]
+                    val av = alpha?.get(i) ?: 255
+                    out[i] = if (((rv or gv or bv or av) ushr 8) == 0) {
+                        (av shl 24) or (rv shl 16) or (gv shl 8) or bv
+                    } else {
+                        (av.coerceIn(0, 255) shl 24) or (rv.coerceIn(0, 255) shl 16) or
+                            (gv.coerceIn(0, 255) shl 8) or bv.coerceIn(0, 255)
+                    }
+                }
+            }
+        } else packModularScaled(r, g, b, alpha, alphaDepth, alphaScale, premul, s)
+        for (c in m) if (c.data !== out) c.data = IntArray(0)
+        return out
+    }
+
+    private fun packModularScaled(
+        r: IntArray, g: IntArray, b: IntArray, alpha: IntArray?, alphaDepth: BitDepth?, alphaScale: Float,
+        premul: Boolean, s: Float,
+    ) {
+        // 高ビット深度や乗算済みアルファは浮動小数点の経路 (channelToPlane → toOutput) と同じ計算にする
         parallelRows(executor, colorH) { y0, y1 ->
             for (i in y0 * colorW until y1 * colorW) {
                 var a = 1f
@@ -1131,11 +1158,9 @@ internal class FrameDecoder(
                 if (premul && a > 0f) {
                     rv /= a; gv /= a; bv /= a
                 }
-                out[i] = (to8(a) shl 24) or (to8(rv) shl 16) or (to8(gv) shl 8) or to8(bv)
+                r[i] = (to8(a) shl 24) or (to8(rv) shl 16) or (to8(gv) shl 8) or to8(bv)
             }
         }
-        for (c in m) if (c.data !== out) c.data = IntArray(0)
-        return out
     }
 
     // ---------------- 逐次描画 ----------------

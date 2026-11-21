@@ -53,8 +53,7 @@ internal class AnsHistogram(
         }
         var next = (state ushr 12) * dist + offset
         if (next < 0x10000) {
-            next = (next shl 16) or br.peek(16).toLong()
-            br.consume(16)
+            next = (next shl 16) or br.readBits(16).toLong()
         }
         reader.ansState = next
         return symbol

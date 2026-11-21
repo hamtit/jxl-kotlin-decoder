@@ -301,7 +301,10 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         val src = fh.blending.source
         val save = fh.saveAsReference
         val base = argbRefs[src]
-        val canvas: IntArray = when {
+        // キャンバスと同じ位置・大きさなら、直接描画の結果をそのまま使い、別の配列を確保しない
+        val fullFrame = fh.x0 == 0 && fh.y0 == 0 && fh.width == w && fh.height == h
+        val target: IntArray? = when {
+            fullFrame -> null
             coversCanvas(fh) -> IntArray(Plane.checkedSize(w, h))
             base == null -> IntArray(Plane.checkedSize(w, h)).also {
                 // 何もないところは透明な黒 (アルファがなければ不透明な黒)
@@ -311,17 +314,19 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
             fh.canReference && save == src -> base
             else -> base.copyOf()
         }
-        if (canvas === base) argbRefs[src] = null
-        val stream = FrameDecoder.StreamOutput(canvas, w, h, fh.x0, fh.y0)
+        if (target != null && target === base) argbRefs[src] = null
+        val stream = FrameDecoder.StreamOutput(target, w, h, fh.x0, fh.y0)
         val decoded = FrameDecoder(header, fh, codestream, toc, refs, lfFrames, executor, seed).decode(stream)
         pos = end.toInt()
         frameIndex++
         if (fh.isLast) finished = true
-        if (stream.pixels == null) {
+        val canvas = stream.pixels ?: run {
             // 逐次描画できないフレームは、浮動小数点で復号して色を変換してから描く
             val img = decoded!!
             convertColor(img)
-            writeArgb(img, canvas, w, h, fh.x0, fh.y0)
+            val out = target ?: IntArray(Plane.checkedSize(w, h))
+            writeArgb(img, out, w, h, fh.x0, fh.y0)
+            out
         }
         if (fh.canReference) {
             refs[save] = null
@@ -333,8 +338,9 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         }
         visibleFrames++
         invisibleSinceVisible = 0
-        // 参照として持つキャンバスは後のフレームが書き換えるので、出力には写しを渡す
-        val pixels = if (fh.canReference && keepRef) canvas.copyOf() else canvas
+        // 参照と出力は配列を共有しない。向きを反映するときは orient が新しい配列を作る
+        val reorients = options.applyOrientation && header.orientation != 1
+        val pixels = if (keepRef && !reorients) canvas.copyOf() else canvas
         return orient(pixels, w, h, frameDuration(fh))
     }
 
