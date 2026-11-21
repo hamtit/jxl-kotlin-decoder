@@ -33,6 +33,11 @@ private fun intOpt(args: List<String>, name: String, def: Int): Int {
     return v
 }
 
+/** 端末に出す前に制御文字 (ESC・改行・C1 制御文字など) を \\uXXXX にする */
+private fun escapeControl(s: String): String = buildString {
+    for (c in s) if (Character.isISOControl(c)) append("\\u%04x".format(c.code)) else append(c)
+}
+
 private fun positional(args: List<String>): List<String> {
     val out = ArrayList<String>()
     var i = 0
@@ -95,7 +100,7 @@ public fun main(argv: Array<String>) {
             if (pos.size < 2) usage()
             val frame = JxlDecoder.decode(File(pos[0]).readBytes(), options(args))
             val ref = ImageIO.read(File(pos[1])) ?: run {
-                System.err.println("読めない画像形式: ${pos[1]}")
+                System.err.println("読めない画像形式: ${escapeControl(pos[1])}")
                 exitProcess(1)
             }
             if (ref.width != frame.width || ref.height != frame.height) {
