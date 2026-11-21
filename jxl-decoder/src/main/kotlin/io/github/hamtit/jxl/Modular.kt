@@ -113,18 +113,32 @@ internal class MaTree(
             lo = minOf(lo, splitValue[i])
             hi = maxOf(hi, splitValue[i])
         }
-        // 最大の分割値より大きい値は全て同じ葉になる
-        val max = hi.toLong() + 1
-        if (max - lo >= LUT_LIMIT) return null
-        val n = (max - lo + 1).toInt()
-        val leaf = IntArray(n)
-        for (k in 0 until n) {
-            val v = lo + k
-            var node = 0
-            while (property[node] >= 0) node = if (v > splitValue[node]) left[node] else right[node]
-            leaf[k] = node
+        // 最大の分割値より大きい値は全て同じ葉になる。Int.MAX_VALUE での分割は左に行く値が無いので、上端はそこで止める
+        val max = minOf(hi.toLong() + 1, Int.MAX_VALUE.toLong()).toInt()
+        if (max.toLong() - lo >= LUT_LIMIT) return null
+        val leaf = IntArray(max - lo + 1)
+        // 木を 1 回だけたどり、各ノードに届く値の区間 [a, b] (表の添字) を子に分けて、葉の区間を埋める。
+        // 区間が空になった枝は打ち切るので、手間はノード数 + 表の大きさで済む
+        val stack = IntArrayList()
+        stack.add(0); stack.add(0); stack.add(leaf.size - 1)
+        var visits = 0
+        while (stack.size > 0) {
+            val b = stack.pop()
+            val a = stack.pop()
+            val node = stack.pop()
+            if (++visits > size) return null // 木でない (同じノードに何度も届く) なら使わない
+            if (property[node] < 0) {
+                java.util.Arrays.fill(leaf, a, b + 1, node)
+                continue
+            }
+            // v > split (添字 k > split - lo) なら左
+            val s = splitValue[node].toLong() - lo
+            val leftA = maxOf(a.toLong(), s + 1)
+            val rightB = minOf(b.toLong(), s)
+            if (leftA <= b) { stack.add(left[node]); stack.add(leftA.toInt()); stack.add(b) }
+            if (a <= rightB) { stack.add(right[node]); stack.add(a); stack.add(rightB.toInt()) }
         }
-        return SinglePropertyLut(p, lo, max.toInt(), leaf)
+        return SinglePropertyLut(p, lo, max, leaf)
     }
 
     /** チャンネル番号・ストリーム番号で分岐するノード */
@@ -145,7 +159,8 @@ internal class MaTree(
 
     companion object {
         private const val LUT_LIMIT = 1L shl 14
-        private const val SPECIALIZED_CACHE_LIMIT = 1024
+        /** 木 1 本あたり、使い回すために残す畳み込んだ木の合計 (Int で 2M 個 = 8 MB) */
+        private const val SPECIALIZED_CACHE_INTS = 1L shl 21
 
         fun parse(br: BitReader, nodeLimit: Int): MaTree {
             val treeCode = EntropyCode.parse(br, 6)
@@ -205,9 +220,18 @@ internal class MaTree(
         val key = BranchKey(bits)
         specialized[key]?.let { return it }
         val t = specializeUncached(channel, stream)
-        if (specialized.size < SPECIALIZED_CACHE_LIMIT) specialized.putIfAbsent(key, t)
+        // 持ち続ける量 (ノードの配列 8 本・表・キー) の合計を上限内に収める。入らなければ使い捨てにする
+        val cost = t.size.toLong() * 8 + (t.singlePropertyLut?.leaf?.size ?: 0) + bits.size * 2L
+        if (specializedBudget.addAndGet(-cost) >= 0) {
+            if (specialized.putIfAbsent(key, t) != null) specializedBudget.addAndGet(cost)
+        } else {
+            specializedBudget.addAndGet(cost)
+        }
         return t
     }
+
+    /** キャッシュに残せる残りの量 (Int の個数) */
+    private val specializedBudget = java.util.concurrent.atomic.AtomicLong(SPECIALIZED_CACHE_INTS)
 
     private fun specializeUncached(channel: Int, stream: Int): MaTree {
         val map = IntArray(size) { -1 }
@@ -270,6 +294,8 @@ internal class IntArrayList(capacity: Int = 16) {
         if (size == a.size) a = a.copyOf(a.size * 2)
         a[size++] = v
     }
+
+    fun pop(): Int = a[--size]
 
     operator fun get(i: Int): Int = a[i]
     fun toArray(): IntArray = a.copyOf(size)
