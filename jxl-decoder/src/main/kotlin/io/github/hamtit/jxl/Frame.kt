@@ -228,6 +228,11 @@ internal class FrameDecoder(
         phase("groups")
         val modularChannels = lfGlobal.gmodular?.finish()
         phase("modularFinish")
+        if (stream != null && modularChannels != null && canDirectModular()) {
+            stream.pixels = modularToArgb(modularChannels)
+            phase("modularToArgb")
+            return null
+        }
         return render(modularChannels)
     }
 
@@ -1007,6 +1012,67 @@ internal class FrameDecoder(
             outExtra = Array(ecCount) { c -> Filters.upsample(Plane(colorW, colorH).also { System.arraycopy(work.extra[c], 0, it.data, 0, it.data.size) }, shift, image, fw, fh).data }
         }
         return FrameImage(header, fw, fh, outColor, outExtra, img.colorTransformPending)
+    }
+
+    // ---------------- Modular の整数サンプルから直接描画 ----------------
+
+    /**
+     * 色変換もフィルタもいらない Modular の画像 (sRGB の可逆圧縮など) か。
+     * その場合は浮動小数点の平面を作らず、整数のサンプルから ARGB を作る
+     */
+    private fun canDirectModular(): Boolean {
+        if (!header.isModular || image.xybEncoded || header.doYCbCr) return false
+        if (header.upsampling != 1 || header.lfLevel != 0) return false
+        if (header.gabor != null || header.epf != null) return false
+        if (header.hasPatches || header.hasSplines || header.hasNoise) return false
+        if (image.bitDepth.isFloat) return false
+        for ((i, ec) in image.extraChannels.withIndex()) {
+            if (header.ecUpsampling[i] != 1 || ec.dimShift != 0) return false
+        }
+        // ColorConvert.toSrgb が何もしない色空間だけ
+        val enc = image.colourEncoding
+        if (!enc.wantIcc) {
+            if (enc.transferFunction != TransferFunction.SRGB) return false
+            if (enc.colourSpace == ColourSpace.RGB && (!enc.isSrgbPrimaries || !enc.isD65)) return false
+        }
+        return true
+    }
+
+    /** 整数のサンプルから ARGB を作る。出力には最初の色チャンネルの配列を使い回す */
+    private fun modularToArgb(m: List<Channel>): IntArray {
+        val n = Plane.checkedSize(colorW, colorH)
+        val cc = header.encodedColorChannels
+        val r = m[0].data
+        val g = if (cc >= 3) m[1].data else r
+        val b = if (cc >= 3) m[2].data else r
+        if (r.size != n || g.size != n || b.size != n) fail("modular channel size mismatch")
+        val s = image.bitDepth.scale()
+        val alphaIdx = image.alphaChannel
+        val alpha = if (alphaIdx >= 0) m[cc + alphaIdx].data else null
+        if (alpha != null && alpha.size != n) fail("modular channel size mismatch")
+        val alphaDepth = if (alphaIdx >= 0) image.extraChannels[alphaIdx].bitDepth else null
+        val alphaScale = alphaDepth?.scale() ?: 0f
+        val premul = alphaIdx >= 0 && image.extraChannels[alphaIdx].alphaAssociated
+        val out = r
+        // 色・アルファは浮動小数点の経路 (channelToPlane → toOutput) と同じ計算にする
+        parallelRows(executor, colorH) { y0, y1 ->
+            for (i in y0 * colorW until y1 * colorW) {
+                var a = 1f
+                if (alpha != null) {
+                    a = if (alphaDepth!!.isFloat) alphaDepth.parseFloatSample(alpha[i]) else alpha[i] * alphaScale
+                    a = a.coerceIn(0f, 1f)
+                }
+                var rv = r[i] * s
+                var gv = g[i] * s
+                var bv = b[i] * s
+                if (premul && a > 0f) {
+                    rv /= a; gv /= a; bv /= a
+                }
+                out[i] = (to8(a) shl 24) or (to8(rv) shl 16) or (to8(gv) shl 8) or to8(bv)
+            }
+        }
+        for (c in m) if (c.data !== out) c.data = IntArray(0)
+        return out
     }
 
     // ---------------- 逐次描画 ----------------
