@@ -87,6 +87,26 @@ class DecoderTest {
     }
 
     @Test
+    fun returnedFramesStayUnchangedAndRewindRepeatsThem() {
+        // 置き換えで重ねるアニメーションはキャンバスをその場で書き換えるので、
+        // 返したフレームが後のフレームの復号で変わらないこと、巻き戻すと同じフレームが出ることを確かめる
+        for (name in listOf("anim_lossy", "anim_lossless")) {
+            val decoder = JxlDecoder(File(dir, "$name.jxl").readBytes(), JxlDecodeOptions(threads = 1))
+            // 返された時点の写しを取っておく
+            val returned = generateSequence { decoder.nextFrame() }.map { it to it.pixels.copyOf() }.toList()
+            val frames = returned.map { it.first }
+            val snapshots = returned.map { it.second }
+            decoder.rewind()
+            val again = generateSequence { decoder.nextFrame() }.toList()
+            assertEquals(frames.size, again.size, name)
+            for (i in frames.indices) {
+                assertTrue(frames[i].pixels.contentEquals(snapshots[i]), "$name frame $i changed")
+                assertTrue(again[i].pixels.contentEquals(snapshots[i]), "$name frame $i after rewind")
+            }
+        }
+    }
+
+    @Test
     fun detectsSignatures() {
         assertTrue(JxlDecoder.isJxl(byteArrayOf(0xff.toByte(), 0x0a)))
         assertTrue(JxlDecoder.isJxl(File(dir, "vardct_container.jxl").readBytes().copyOf(12)))
