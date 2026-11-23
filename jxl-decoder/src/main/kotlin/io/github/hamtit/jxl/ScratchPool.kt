@@ -58,4 +58,10 @@ internal object ScratchPool {
     }
 
     fun give(a: FloatArray) = give(a, a.size * 4L)
+
+    /** 長さ n 以上の IntArray (中身は不定) */
+    fun ints(n: Int): IntArray =
+        take(IntArray::class.java) { it.size >= n && it.size / 2 <= n } ?: IntArray(n)
+
+    fun give(a: IntArray) = give(a, a.size * 4L)
 }

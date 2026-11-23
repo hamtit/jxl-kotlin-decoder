@@ -538,6 +538,8 @@ internal class ModularImage(
              * 変わらない) なら、配列を確保せずここに直接復号する。[ModularImage.direct] でどちらになったか分かる
              */
             targets: List<Channel>? = null,
+            /** false なら配列を確保しない (呼び出し側が必要な分だけ [Channel.allocate] する) */
+            allocate: Boolean = true,
         ): ModularImage {
             val header = ModularHeader.parse(br)
             val chans = channelsIn.map { it.copyMeta() }.toMutableList()
@@ -559,7 +561,7 @@ internal class ModularImage(
                     val t = targets[i]
                     chans[i].bind(t.data, t.offset, t.stride)
                 }
-            } else {
+            } else if (allocate) {
                 for (c in chans) c.allocate()
             }
             return ModularImage(header, tree, channelsIn, chans, nbMeta, bitDepth, direct)

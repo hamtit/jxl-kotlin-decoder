@@ -213,6 +213,13 @@ internal class FrameDecoder(
 
         val vardct = !header.isModular
         if (vardct) initVarDct()
+        if (stream != null && canStreamModular()) {
+            phase("lfGlobal")
+            stream.pixels = decodeModularStreaming(stream)
+            phase("modularGroups")
+            return null
+        }
+        allocateModular()
         phase("lfGlobal")
 
         // LF グループ
@@ -325,7 +332,8 @@ internal class FrameDecoder(
         var gmod: ModularImage? = null
         var decoded = 0
         if (chans.isNotEmpty()) {
-            gmod = ModularImage.read(br, chans, tree, image.bitDepth.bitsPerSample)
+            // グループで復号するチャンネルの配列は、グループごとに描画しない場合だけ後で確保する (allocateModular)
+            gmod = ModularImage.read(br, chans, tree, image.bitDepth.bitsPerSample, allocate = false)
             val list = gmod.channels
             var end = 0
             while (end < list.size) {
@@ -333,6 +341,7 @@ internal class FrameDecoder(
                 if (end >= gmod.nbMetaChannels && (c.width > gd || c.height > gd)) break
                 end++
             }
+            for (i in 0 until end) list[i].allocate()
             gmod.decodeChannels(br, 0, 0, end)
             decoded = end
         }
@@ -1104,63 +1113,143 @@ internal class FrameDecoder(
     /** 整数のサンプルから ARGB を作る。出力には最初の色チャンネルの配列を使い回す */
     private fun modularToArgb(m: List<Channel>): IntArray {
         val n = Plane.checkedSize(colorW, colorH)
+        for (c in m) if (c.width != colorW || c.height != colorH) fail("modular channel size mismatch")
+        val out = m[0].data
+        if (out.size != n) fail("modular channel size mismatch")
+        // 出力の画素 i は、どのチャンネルでも同じ位置 i から作るので、最初のチャンネルに上書きしてよい
+        parallelRows(executor, colorH) { y0, y1 ->
+            packModular(m, out, 0, colorW, 0, colorW, y0, y1)
+        }
+        for (c in m) if (c.data !== out) c.data = IntArray(0)
+        return out
+    }
+
+    /**
+     * Modular のチャンネル [m] (変換前の並び、幅 w) の行 ya..yb・列 xa..xb を ARGB にして、
+     * 画素 (x, y) を out[outBase + y * outStride + x] に書く
+     */
+    private fun packModular(
+        m: List<Channel>, out: IntArray, outBase: Int, outStride: Int, xa: Int, xb: Int, ya: Int, yb: Int,
+    ) {
+        if (xa >= xb) return
         val cc = header.encodedColorChannels
-        val r = m[0].data
-        val g = if (cc >= 3) m[1].data else r
-        val b = if (cc >= 3) m[2].data else r
-        if (r.size != n || g.size != n || b.size != n) fail("modular channel size mismatch")
-        val s = image.bitDepth.scale()
+        val cr = m[0]
+        val cg = if (cc >= 3) m[1] else cr
+        val cb = if (cc >= 3) m[2] else cr
+        val r = cr.data
+        val g = cg.data
+        val b = cb.data
         val alphaIdx = image.alphaChannel
-        val alpha = if (alphaIdx >= 0) m[cc + alphaIdx].data else null
-        if (alpha != null && alpha.size != n) fail("modular channel size mismatch")
+        val ca = if (alphaIdx >= 0) m[cc + alphaIdx] else null
+        val alpha = ca?.data
         val alphaDepth = if (alphaIdx >= 0) image.extraChannels[alphaIdx].bitDepth else null
-        val alphaScale = alphaDepth?.scale() ?: 0f
         val premul = alphaIdx >= 0 && image.extraChannels[alphaIdx].alphaAssociated
-        val out = r
-        if (!premul && image.bitDepth.bitsPerSample == 8 &&
+        val fast = !premul && image.bitDepth.bitsPerSample == 8 &&
             (alphaDepth == null || (!alphaDepth.isFloat && alphaDepth.bitsPerSample == 8))
-        ) {
-            // 8 ビット整数を正規化してから 8 ビットに丸め直すと、0..255 への切り詰めと同じになる
-            parallelRows(executor, colorH) { y0, y1 ->
-                for (i in y0 * colorW until y1 * colorW) {
-                    val rv = r[i]
-                    val gv = g[i]
-                    val bv = b[i]
-                    val av = alpha?.get(i) ?: 255
-                    out[i] = if (((rv or gv or bv or av) ushr 8) == 0) {
+        val s = image.bitDepth.scale()
+        val alphaScale = alphaDepth?.scale() ?: 0f
+        for (y in ya until yb) {
+            val ir = cr.offset + y * cr.stride
+            val ig = cg.offset + y * cg.stride
+            val ib = cb.offset + y * cb.stride
+            val ia = if (ca != null) ca.offset + y * ca.stride else 0
+            val io = outBase + y * outStride
+            if (fast) {
+                // 8 ビット整数を正規化してから 8 ビットに丸め直すと、0..255 への切り詰めと同じになる
+                for (x in xa until xb) {
+                    val rv = r[ir + x]
+                    val gv = g[ig + x]
+                    val bv = b[ib + x]
+                    val av = if (alpha != null) alpha[ia + x] else 255
+                    out[io + x] = if (((rv or gv or bv or av) ushr 8) == 0) {
                         (av shl 24) or (rv shl 16) or (gv shl 8) or bv
                     } else {
                         (av.coerceIn(0, 255) shl 24) or (rv.coerceIn(0, 255) shl 16) or
                             (gv.coerceIn(0, 255) shl 8) or bv.coerceIn(0, 255)
                     }
                 }
-            }
-        } else packModularScaled(r, g, b, alpha, alphaDepth, alphaScale, premul, s)
-        for (c in m) if (c.data !== out) c.data = IntArray(0)
-        return out
-    }
-
-    private fun packModularScaled(
-        r: IntArray, g: IntArray, b: IntArray, alpha: IntArray?, alphaDepth: BitDepth?, alphaScale: Float,
-        premul: Boolean, s: Float,
-    ) {
-        // 高ビット深度や乗算済みアルファは浮動小数点の経路 (channelToPlane → toOutput) と同じ計算にする
-        parallelRows(executor, colorH) { y0, y1 ->
-            for (i in y0 * colorW until y1 * colorW) {
-                var a = 1f
-                if (alpha != null) {
-                    a = if (alphaDepth!!.isFloat) alphaDepth.parseFloatSample(alpha[i]) else alpha[i] * alphaScale
-                    a = a.coerceIn(0f, 1f)
+            } else {
+                // 高ビット深度や乗算済みアルファは浮動小数点の経路 (channelToPlane → toOutput) と同じ計算にする
+                for (x in xa until xb) {
+                    var a = 1f
+                    if (alpha != null) {
+                        val raw = alpha[ia + x]
+                        a = if (alphaDepth!!.isFloat) alphaDepth.parseFloatSample(raw) else raw * alphaScale
+                        a = a.coerceIn(0f, 1f)
+                    }
+                    var rv = r[ir + x] * s
+                    var gv = g[ig + x] * s
+                    var bv = b[ib + x] * s
+                    if (premul && a > 0f) {
+                        rv /= a; gv /= a; bv /= a
+                    }
+                    out[io + x] = (to8(a) shl 24) or (to8(rv) shl 16) or (to8(gv) shl 8) or to8(bv)
                 }
-                var rv = r[i] * s
-                var gv = g[i] * s
-                var bv = b[i] * s
-                if (premul && a > 0f) {
-                    rv /= a; gv /= a; bv /= a
-                }
-                r[i] = (to8(a) shl 24) or (to8(rv) shl 16) or (to8(gv) shl 8) or to8(bv)
             }
         }
+    }
+
+    /** グローバル Modular 画像のうち、まだ配列のないチャンネルを確保する */
+    private fun allocateModular() {
+        val g = lfGlobal.gmodular ?: return
+        for (i in lfGlobal.gmodularDecoded until g.channels.size) g.channels[i].allocate()
+    }
+
+    /**
+     * 可逆 (Modular) の画像を、グループごとに小さな配列へ復号して直接 ARGB に書けるか。
+     * 全体にかかる変換が RCT だけ (画素ごとの計算) で、全チャンネルがグループに分かれていれば、
+     * 画像全体の大きさのチャンネルの配列を作らずに済む
+     */
+    private fun canStreamModular(): Boolean {
+        if (!canDirectModular() || toc.singleEntry || header.passes.numPasses != 1) return false
+        val g = lfGlobal.gmodular ?: return false
+        if (lfGlobal.gmodularDecoded != 0 || g.nbMetaChannels != 0) return false
+        if (!g.header.transforms.all { it is Transform.Rct }) return false
+        val cc = header.encodedColorChannels
+        if (g.channels.size != cc + image.extraChannels.size) return false
+        for (c in g.channels) {
+            if (c.hshift != 0 || c.vshift != 0 || c.width != colorW || c.height != colorH) return false
+        }
+        return true
+    }
+
+    private fun decodeModularStreaming(stream: StreamOutput): IntArray {
+        val g = lfGlobal.gmodular!!
+        val out = stream.target ?: IntArray(Plane.checkedSize(colorW, colorH))
+        val outW = if (stream.target != null) stream.targetW else colorW
+        val outH = if (stream.target != null) stream.targetH else colorH
+        val ox = if (stream.target != null) stream.ox else 0
+        val oy = if (stream.target != null) stream.oy else 0
+        val nch = g.channels.size
+        val rcts = g.header.transforms.reversed().map { it as Transform.Rct }
+        parallelFor(executor, numGroups) { gi ->
+            val gx = gi % header.groupsPerRow
+            val gy = gi / header.groupsPerRow
+            val parts = groupChannels(false, gx, gy, 0, 0)
+            if (parts.size != nch) fail("modular channel count mismatch")
+            val gw = parts[0].ch.width
+            val gh = parts[0].ch.height
+            val buf = ScratchPool.ints(gw * gh * nch)
+            try {
+                val targets = parts.mapIndexed { k, p ->
+                    if (p.index != k || p.ch.width != gw || p.ch.height != gh) fail("modular channel size mismatch")
+                    Channel(gw, gh, 0, 0).also { it.bind(buf, k * gw * gh, gw) }
+                }
+                val br = passGroupSection(0, gi)
+                val img = ModularImage.read(br, parts.map { it.ch }, lfGlobal.globalTree, image.bitDepth.bitsPerSample, targets)
+                val result = img.decodeAll(br, 1 + 3 * numLf + 17 + gi).toMutableList()
+                br.checkOverrun()
+                for (tr in rcts) inverseRct(tr, result)
+                // グループの画素 (x, y) はキャンバスの (x0 + ox + x, y0 + oy + y)。はみ出す部分は書かない
+                val tx = parts[0].x0 + ox
+                val ty = parts[0].y0 + oy
+                packModular(result, out, ty * outW + tx, outW,
+                    maxOf(0, -tx), minOf(gw, outW - tx), maxOf(0, -ty), minOf(gh, outH - ty))
+            } finally {
+                ScratchPool.give(buf)
+            }
+        }
+        return out
     }
 
     // ---------------- 逐次描画 ----------------
@@ -1175,7 +1264,11 @@ internal class FrameDecoder(
         if (toc.singleEntry) return false
         val g = lfGlobal.gmodular
         if (g != null) {
-            if (g.header.transforms.isNotEmpty()) return false
+            // 変換 (アルファの Squeeze など) があれば、追加チャンネルは全グループの復号後に逆変換してからアルファを書き込む。
+            // 乗算済みアルファは色の計算にアルファが要るので、変換がないときだけ
+            if (g.header.transforms.isNotEmpty() && image.alphaChannel >= 0 &&
+                image.extraChannels[image.alphaChannel].alphaAssociated
+            ) return false
             for ((i, ec) in image.extraChannels.withIndex()) {
                 if (header.ecUpsampling[i] != 1 || ec.dimShift != 0) return false
             }
@@ -1207,7 +1300,9 @@ internal class FrameDecoder(
         val epfHalo = epfRadius.sum()
         val halo = epfHalo + (if (gab != null) 1 else 0)
         val alphaIdx = image.alphaChannel
-        val alpha = if (alphaIdx >= 0) lfGlobal.gmodular?.channels?.get(alphaIdx) else null
+        // 変換のある Modular 画像では、アルファは最後に逆変換してから書き込む (それまでは不透明として描く)
+        val lateAlpha = lfGlobal.gmodular?.header?.transforms?.isNotEmpty() == true
+        val alpha = if (alphaIdx >= 0 && !lateAlpha) lfGlobal.gmodular?.channels?.get(alphaIdx) else null
         val alphaDepth = if (alphaIdx >= 0) image.extraChannels[alphaIdx].bitDepth else null
         val premul = alphaIdx >= 0 && image.extraChannels[alphaIdx].alphaAssociated
         // 逆 DCT 後の値は、今のグループ行 (行 curY0 から gd 行) と、その直前の carryRows 行だけを持つ。
@@ -1242,11 +1337,17 @@ internal class FrameDecoder(
                 val ou = idctOff(yu)
                 val sd = idctRow(c, yd)
                 val od = idctOff(yd)
-                for (x in 0 until w) {
+                // 左右の端 (隣を鏡映する) だけ別に計算し、内側は分岐なしで回す
+                for (x in intArrayOf(0, w - 1)) {
                     val xl = if (x > 0) x - 1 else 0
                     val xr = if (x + 1 < w) x + 1 else w - 1
                     val side = su[ou + x] + sd[od + x] + src[o + xl] + src[o + xr]
                     val diag = su[ou + xl] + su[ou + xr] + sd[od + xl] + sd[od + xr]
+                    dst[off + x] = (src[o + x] + side * w0 + diag * w1) * norm
+                }
+                for (x in 1 until w - 1) {
+                    val side = su[ou + x] + sd[od + x] + src[o + x - 1] + src[o + x + 1]
+                    val diag = su[ou + x - 1] + su[ou + x + 1] + sd[od + x - 1] + sd[od + x + 1]
                     dst[off + x] = (src[o + x] + side * w0 + diag * w1) * norm
                 }
             }
@@ -1368,6 +1469,28 @@ internal class FrameDecoder(
         for (c in 0 until 3) {
             ScratchPool.give(cur[c])
             ScratchPool.give(carry[c])
+        }
+        if (lateAlpha) {
+            val chans = lfGlobal.gmodular!!.finish()
+            if (alphaIdx >= 0) {
+                val a = chans[alphaIdx]
+                if (a.width != w || a.height != h) fail("modular channel size mismatch")
+                val ad = alphaDepth!!
+                parallelRows(executor, h) { y0, y1 ->
+                    for (y in y0 until y1) {
+                        val ty = y + oy
+                        if (ty < 0 || ty >= outH) continue
+                        val ao = a.offset + y * a.stride
+                        val to = ty * outW + ox
+                        for (x in xa until xb) {
+                            val raw = a.data[ao + x]
+                            var av = if (ad.isFloat) ad.parseFloatSample(raw) else raw * alphaScale
+                            if (av < 0f) av = 0f else if (av > 1f) av = 1f
+                            out[to + x] = (out[to + x] and 0xffffff) or (to8(av) shl 24)
+                        }
+                    }
+                }
+            }
         }
         return out
     }
