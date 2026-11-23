@@ -559,13 +559,14 @@ internal object Filters {
             val st = stages[k]
             val pv = stages[k - 1]
             val p = params!!
-            while (st.rawNext <= y + 1) {
-                rawDiff0(k, st.rawNext)
-                st.rawNext++
-            }
-            // 縦・斜め 4 方向の 5 点十字和 (4 行の環状バッファ)
+            // 縦・斜め 4 方向の 5 点十字和 (4 行の環状バッファ)。行 r の十字和には r-1..r+1 が要るので、
+            // 4 行環状バッファの古い行 (y-3) を r=y-2 で読み終えてから次の行 (y+1) を書く
             while (st.vcNext <= y) {
                 val r = st.vcNext
+                while (st.rawNext <= r + 1) {
+                    rawDiff0(k, st.rawNext)
+                    st.rawNext++
+                }
                 val vr = (r and 3) * pw
                 val vu = ((r - 1) and 3) * pw
                 val vn = ((r + 1) and 3) * pw

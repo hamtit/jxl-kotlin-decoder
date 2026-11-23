@@ -604,7 +604,7 @@ internal class EntropyCode private constructor(
                 reader.begin(br)
                 out = ByteArray(numDist) {
                     val v = reader.read(br, 0)
-                    if (v > 255) fail("invalid cluster index")
+                    if (v !in 0..255) fail("invalid cluster index")
                     v.toByte()
                 }
                 reader.finish()
