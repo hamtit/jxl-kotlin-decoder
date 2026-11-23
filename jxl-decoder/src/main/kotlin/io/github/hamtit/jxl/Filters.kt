@@ -154,6 +154,10 @@ internal object Filters {
      *
      * 各段階の行 y は配列の (y and mask) * (w + 6) から始まり、画素 x は +3+x (左右 3 画素は鏡映)。
      * 画像の外の行は、入力では [RowSource] が、EPF の段階では計算した行を鏡映して返す。
+     *
+     * 画像の一部の列 (窓) だけを計算することもできる ([begin] の xBlock0)。窓を幅 w の画像とみなして計算するので、
+     * 窓の端が画像の端でない側では、端から (入力の Gaborish を含めた) halo 画素以内の結果は正しくない。
+     * 使う列の外側に halo 画素以上の余白を付けた窓を渡すこと。
      */
     class EpfRows {
         private class Stage {
@@ -201,18 +205,23 @@ internal object Filters {
         private var params: EpfParams? = null
         private var sigma: FloatArray? = null
         private var sigmaStride = 0
+        /** 窓の左端のブロック列 (sigma の列の位置に足す) */
+        private var xb0 = 0
         private var nis = FloatArray(0)
         private val tapK = IntArray(12)
         private val tapA = IntArray(60)
         private val tapB = IntArray(60)
 
         /**
-         * 行 [y0] から計算を始める。[steps] は EPF の段階の並び (空なら入力をそのまま返す)
+         * 行 [y0] から計算を始める。[steps] は EPF の段階の並び (空なら入力をそのまま返す)。
+         * 窓を計算するときは、[w] が窓の幅、[xBlock0] が窓の左端の画像のブロック列 (窓の左端は 8 の倍数の列)
          */
         fun begin(
             src: RowSource, w: Int, h: Int, steps: IntArray, params: EpfParams?, sigma: FloatArray?, sigmaStride: Int, y0: Int,
+            xBlock0: Int = 0,
         ) {
             this.src = src
+            this.xb0 = xBlock0
             this.w = w
             this.h = h
             this.params = params
@@ -308,7 +317,7 @@ internal object Filters {
         /** ブロック行 br・ブロック列 bx を平滑化するか (sigma が小さいブロックはそのまま写す) */
         private fun blockActive(br: Int, bx: Int): Boolean {
             val sig = sigma
-            val s = if (sig != null) sig[br * sigmaStride + bx] else params!!.sigmaForModular
+            val s = if (sig != null) sig[br * sigmaStride + xb0 + bx] else params!!.sigmaForModular
             return !(s < 0.3f)
         }
 
@@ -399,7 +408,7 @@ internal object Filters {
             val o1 = st.rows[1]
             val o2 = st.rows[2]
             val sig = sigma
-            val sRow = (y shr 3) * sigmaStride
+            val sRow = (y shr 3) * sigmaStride + xb0
             val yBorder = ((y + 1) and 6) == 0
             val nisRow = nis
             var bx = 0
@@ -479,7 +488,7 @@ internal object Filters {
             val sig = sigma
             val yBorder = ((y + 1) and 6) == 0
             for (x in 0 until w) {
-                val s = if (sig != null) sig[(y shr 3) * sigmaStride + (x shr 3)] else p.sigmaForModular
+                val s = if (sig != null) sig[(y shr 3) * sigmaStride + xb0 + (x shr 3)] else p.sigmaForModular
                 val li = x + 3
                 val pi = pm + li
                 val oi = o + li

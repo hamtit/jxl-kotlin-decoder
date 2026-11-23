@@ -28,8 +28,8 @@ internal fun addLog2Ceil(x: Int): Int {
 
 /** ANS のヒストグラム (エイリアス表) */
 internal class AnsHistogram(
-    private val buckets: LongArray,
-    private val logBucketSize: Int,
+    val buckets: LongArray,
+    val logBucketSize: Int,
     val singleSymbol: Int,
 ) {
     /** state は 32 ビット符号なし値を Long で持つ */
@@ -489,6 +489,40 @@ internal class EntropyCode private constructor(
 ) {
     val usesAns: Boolean get() = ans != null
 
+    /**
+     * ANS で LZ77 なしのときの、全クラスタのエイリアス表を並べた表 (クラスタ c の表は c shl [fastLogAlphabet] から)。
+     * [EntropyReader.readAnsFast] で、クラスタごとのオブジェクトを辿らずに読むのに使う。それ以外は null
+     */
+    val fastBuckets: LongArray?
+    val fastLogAlphabet: Int
+    /** クラスタ c の hybrid-uint の設定 (split・splitExponent・msbInToken・lsbInToken) を c * 4 から並べた表 */
+    val fastConfigs: IntArray
+
+    init {
+        val a = ans
+        if (a != null && !lz77Enabled && a.isNotEmpty()) {
+            val lb = a[0].logBucketSize
+            val logAlpha = 12 - lb
+            fastLogAlphabet = logAlpha
+            fastBuckets = LongArray(a.size shl logAlpha).also { fb ->
+                for ((i, h) in a.withIndex()) {
+                    if (h.logBucketSize != lb || h.buckets.size != (1 shl logAlpha)) error("ANS table size mismatch")
+                    System.arraycopy(h.buckets, 0, fb, i shl logAlpha, 1 shl logAlpha)
+                }
+            }
+        } else {
+            fastLogAlphabet = 0
+            fastBuckets = null
+        }
+        fastConfigs = IntArray(configs.size * 4)
+        for ((i, c) in configs.withIndex()) {
+            fastConfigs[4 * i] = c.split
+            fastConfigs[4 * i + 1] = c.splitExponent
+            fastConfigs[4 * i + 2] = c.msbInToken
+            fastConfigs[4 * i + 3] = c.lsbInToken
+        }
+    }
+
     fun newReader(): EntropyReader = EntropyReader(this)
 
     fun readSymbol(br: BitReader, cluster: Int, reader: EntropyReader): Int {
@@ -643,6 +677,45 @@ internal class EntropyReader(val code: EntropyCode) {
     }
 
     fun read(br: BitReader, ctx: Int): Int = readClustered(br, code.clusters[ctx], 0)
+
+    /**
+     * [EntropyCode.fastBuckets] がある (ANS で LZ77 なし) ときに、クラスタ [cluster] の値を読む。
+     * [readClustered] と同じ結果を、表を 1 つの配列から引いて求める ([begin] で状態を読んでおくこと)
+     */
+    fun readAnsFast(br: BitReader, buckets: LongArray, logAlpha: Int, cfg: IntArray, cluster: Int): Int {
+        // ANS のシンボル (AnsHistogram.readSymbol と同じ)
+        val state = ansState
+        val idx = (state and 0xfff).toInt()
+        val logBucket = 12 - logAlpha
+        val i = idx ushr logBucket
+        val pos = idx and ((1 shl logBucket) - 1)
+        val b = buckets[(cluster shl logAlpha) + i]
+        val cutoff = ((b ushr 8) and 0xff).toInt()
+        var dist = ((b ushr 16) and 0xffff).toInt()
+        val token: Int
+        val offset: Int
+        if (pos >= cutoff) {
+            offset = ((b ushr 32) and 0xffff).toInt() + pos
+            dist = dist xor ((b ushr 48) and 0xffff).toInt()
+            token = (b and 0xff).toInt()
+        } else {
+            offset = pos
+            token = i
+        }
+        var next = (state ushr 12) * dist + offset
+        if (next < 0x10000) next = (next shl 16) or br.readBits(16).toLong()
+        ansState = next
+        // hybrid-uint (readUint と同じ)
+        val c4 = cluster * 4
+        if (token < cfg[c4]) return token
+        val msb = cfg[c4 + 2]
+        val lsb = cfg[c4 + 3]
+        val n = (cfg[c4 + 1] - (msb + lsb) + ((token - cfg[c4]) ushr (msb + lsb))) and 31
+        val rest = br.readBits(n).toLong() and 0xffffffffL
+        val lowBits = token and ((1 shl lsb) - 1)
+        val t = ((token ushr lsb) and ((1 shl msb) - 1)) or (1 shl msb)
+        return (((t.toLong() shl n) or rest) shl lsb or lowBits.toLong()).toInt()
+    }
 
     fun readClustered(br: BitReader, cluster: Int, distMultiplier: Int): Int {
         if (!code.lz77Enabled) {
