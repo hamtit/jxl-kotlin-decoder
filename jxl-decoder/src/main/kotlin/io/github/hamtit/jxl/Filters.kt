@@ -290,13 +290,47 @@ internal object Filters {
             val plus = st.step == 1
             val h0 = if (plus) 1 else 2
             val h1 = if (plus) w + 4 else w + 3
-            for (x in h0 until h1) {
-                hd[lb + x] = s0 * kotlin.math.abs(p0[a + x + 1] - p0[a + x]) + s1 * kotlin.math.abs(p1[a + x + 1] - p1[a + x]) +
-                    s2 * kotlin.math.abs(p2[a + x + 1] - p2[a + x])
+            // この行の差分を使うのは、出力の行 r-1 .. r+2 の平滑化するブロック (の左 2・右 1 画素まで) だけ
+            forActiveRuns(r - 1, r + 2) { xs, xe ->
+                val x0 = maxOf(h0, xs + 1)
+                val x1 = minOf(h1, xe + 4)
+                for (x in x0 until x1) {
+                    hd[lb + x] = s0 * kotlin.math.abs(p0[a + x + 1] - p0[a + x]) + s1 * kotlin.math.abs(p1[a + x + 1] - p1[a + x]) +
+                        s2 * kotlin.math.abs(p2[a + x + 1] - p2[a + x])
+                }
+                for (x in maxOf(h0 + 1, x0) until x1) {
+                    vd[lb + x] = s0 * kotlin.math.abs(p0[b + x] - p0[a + x]) + s1 * kotlin.math.abs(p1[b + x] - p1[a + x]) +
+                        s2 * kotlin.math.abs(p2[b + x] - p2[a + x])
+                }
             }
-            for (x in h0 + 1 until h1) {
-                vd[lb + x] = s0 * kotlin.math.abs(p0[b + x] - p0[a + x]) + s1 * kotlin.math.abs(p1[b + x] - p1[a + x]) +
-                    s2 * kotlin.math.abs(p2[b + x] - p2[a + x])
+        }
+
+        /** ブロック行 br・ブロック列 bx を平滑化するか (sigma が小さいブロックはそのまま写す) */
+        private fun blockActive(br: Int, bx: Int): Boolean {
+            val sig = sigma
+            val s = if (sig != null) sig[br * sigmaStride + bx] else params!!.sigmaForModular
+            return !(s < 0.3f)
+        }
+
+        /**
+         * 出力の行 ya..yb のどれかで平滑化するブロックが続く列の範囲 [xs, xe) (画素) ごとに f を呼ぶ。
+         * 画像の外の行は含めない
+         */
+        private inline fun forActiveRuns(ya: Int, yb: Int, f: (Int, Int) -> Unit) {
+            val br0 = maxOf(0, ya) shr 3
+            val br1 = (minOf(h - 1, yb)) shr 3
+            if (br1 < br0) return
+            val nb = (w + 7) shr 3
+            var bx = 0
+            while (bx < nb) {
+                if (!blockActive(br0, bx) && (br1 == br0 || !blockActive(br1, bx))) {
+                    bx++
+                    continue
+                }
+                val bs = bx
+                bx++
+                while (bx < nb && (blockActive(br0, bx) || (br1 != br0 && blockActive(br1, bx)))) bx++
+                f(bs * 8, minOf(w, bx * 8))
             }
         }
 
@@ -323,7 +357,12 @@ internal object Filters {
                 val u = ((y - 1) and 3) * pw
                 val dn = ((y + 1) and 3) * pw
                 val hc = st.hc
-                for (x in 2 until w + 3) hc[x] = d[c + x] + d[u + x] + d[dn + x] + d[c + x - 1] + d[c + x + 1]
+                // 十字の和も、平滑化する画素が使う列だけ (hc は左 1 画素まで、vc はその行と次の行で使う)
+                forActiveRuns(y, y) { xs, xe ->
+                    for (x in maxOf(2, xs + 2) until minOf(w + 3, xe + 3)) {
+                        hc[x] = d[c + x] + d[u + x] + d[dn + x] + d[c + x - 1] + d[c + x + 1]
+                    }
+                }
                 while (st.vcNext <= y) {
                     val r = st.vcNext
                     val v = st.vd
@@ -331,7 +370,11 @@ internal object Filters {
                     val vr = (r and 3) * pw
                     val vu = ((r - 1) and 3) * pw
                     val vn = ((r + 1) and 3) * pw
-                    for (x in 3 until w + 3) vc[vr + x] = v[vr + x] + v[vu + x] + v[vn + x] + v[vr + x - 1] + v[vr + x + 1]
+                    forActiveRuns(r, r + 1) { xs, xe ->
+                        for (x in maxOf(3, xs + 3) until minOf(w + 3, xe + 3)) {
+                            vc[vr + x] = v[vr + x] + v[vu + x] + v[vn + x] + v[vr + x - 1] + v[vr + x + 1]
+                        }
+                    }
                     st.vcNext++
                 }
                 sh = hc
