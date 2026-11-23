@@ -48,14 +48,21 @@ internal object Filters {
             System.arraycopy(p, 0, up, 0, w)
             for (y in 0 until h) {
                 val r2 = minOf(y + 1, h - 1) * w
-                for (x in 0 until w) {
+                // 下の行 (最後の行では自分の行の元の値)
+                val dn = if (y + 1 < h) p else mid
+                val dno = if (y + 1 < h) r2 else 0
+                // 左右の端 (隣を鏡映する) だけ別に計算し、内側は分岐なしで回す
+                for (edge in 0 until minOf(w, 2)) {
+                    val x = edge * (w - 1)
                     val xl = if (x > 0) x - 1 else 0
                     val xr = if (x + 1 < w) x + 1 else w - 1
-                    val dn = if (y + 1 < h) p[r2 + x] else mid[x]
-                    val dnl = if (y + 1 < h) p[r2 + xl] else mid[xl]
-                    val dnr = if (y + 1 < h) p[r2 + xr] else mid[xr]
-                    val side = up[x] + dn + mid[xl] + mid[xr]
-                    val diag = up[xl] + up[xr] + dnl + dnr
+                    val side = up[x] + dn[dno + x] + mid[xl] + mid[xr]
+                    val diag = up[xl] + up[xr] + dn[dno + xl] + dn[dno + xr]
+                    outRow[x] = (mid[x] + side * w0 + diag * w1) * norm
+                }
+                for (x in 1 until w - 1) {
+                    val side = up[x] + dn[dno + x] + mid[x - 1] + mid[x + 1]
+                    val diag = up[x - 1] + up[x + 1] + dn[dno + x - 1] + dn[dno + x + 1]
                     outRow[x] = (mid[x] + side * w0 + diag * w1) * norm
                 }
                 val t = up
