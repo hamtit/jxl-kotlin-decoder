@@ -1113,7 +1113,10 @@ internal class FrameDecoder(
     /** 整数のサンプルから ARGB を作る。出力には最初の色チャンネルの配列を使い回す */
     private fun modularToArgb(m: List<Channel>): IntArray {
         val n = Plane.checkedSize(colorW, colorH)
-        for (c in m) if (c.width != colorW || c.height != colorH) fail("modular channel size mismatch")
+        // packModular が読むのは色チャンネルとアルファだけ
+        val cc = header.encodedColorChannels
+        val used = (0 until minOf(cc, 3)) + (if (image.alphaChannel >= 0) listOf(cc + image.alphaChannel) else emptyList())
+        for (i in used) if (m[i].width != colorW || m[i].height != colorH) fail("modular channel size mismatch")
         val out = m[0].data
         if (out.size != n) fail("modular channel size mismatch")
         // 出力の画素 i は、どのチャンネルでも同じ位置 i から作るので、最初のチャンネルに上書きしてよい
@@ -1338,7 +1341,8 @@ internal class FrameDecoder(
                 val sd = idctRow(c, yd)
                 val od = idctOff(yd)
                 // 左右の端 (隣を鏡映する) だけ別に計算し、内側は分岐なしで回す
-                for (x in intArrayOf(0, w - 1)) {
+                for (edge in 0 until minOf(w, 2)) {
+                    val x = edge * (w - 1)
                     val xl = if (x > 0) x - 1 else 0
                     val xr = if (x + 1 < w) x + 1 else w - 1
                     val side = su[ou + x] + sd[od + x] + src[o + xl] + src[o + xr]

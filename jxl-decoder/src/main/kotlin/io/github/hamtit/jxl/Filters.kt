@@ -52,7 +52,8 @@ internal object Filters {
                 val dn = if (y + 1 < h) p else mid
                 val dno = if (y + 1 < h) r2 else 0
                 // 左右の端 (隣を鏡映する) だけ別に計算し、内側は分岐なしで回す
-                for (x in intArrayOf(0, w - 1)) {
+                for (edge in 0 until minOf(w, 2)) {
+                    val x = edge * (w - 1)
                     val xl = if (x > 0) x - 1 else 0
                     val xr = if (x + 1 < w) x + 1 else w - 1
                     val side = up[x] + dn[dno + x] + mid[xl] + mid[xr]
