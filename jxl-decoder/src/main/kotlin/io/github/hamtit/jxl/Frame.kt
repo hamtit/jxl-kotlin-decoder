@@ -659,11 +659,31 @@ internal class FrameDecoder(
             gbw = minOf(gd / 8, bw - gx * (gd / 8))
             gbh = minOf(gd / 8, bh - gy * (gd / 8))
             gs = GroupScratch.obtain(minOf(gd, bw * 8) * minOf(gd, bh * 8), header.passes.numPasses > 1)
+            // 係数は書き込み先 (帯または色平面) のグループの場所に直接置き、その場で逆変換する
+            val bx0 = gx * (gd / 8)
+            val by0 = gy * (gd / 8)
             for (c in 0 until 3) {
-                val n = ((gbw shr hShift[c]) * 8) * ((gbh shr vShift[c]) * 8)
-                gs.coeffs[c].fill(0f, 0, n)
-                gs.intCoeffs?.get(c)?.fill(0, 0, n)
-                gs.nzRows[c].fill(0, 0, n / 64)
+                val cw = (gbw shr hShift[c]) * 8
+                val chh = (gbh shr vShift[c]) * 8
+                val px0 = (bx0 shr hShift[c]) * 8
+                val py0 = (by0 shr vShift[c]) * 8
+                if (target != null) {
+                    gs.out[c] = target[c]
+                    gs.outStride[c] = bw * 8
+                    gs.outBase[c] = (py0 - targetY0) * (bw * 8) + px0
+                } else {
+                    val plane = colorPlanes!![c]
+                    gs.out[c] = plane.data
+                    gs.outStride[c] = plane.width
+                    gs.outBase[c] = py0 * plane.width + px0
+                }
+                val o = gs.out[c]!!
+                for (y in 0 until chh) {
+                    val r = gs.outBase[c] + y * gs.outStride[c]
+                    o.fill(0f, r, r + cw)
+                }
+                gs.intCoeffs?.get(c)?.fill(0, 0, cw * chh)
+                gs.nzRows[c].fill(0, 0, cw * chh / 64)
             }
         }
         try {
@@ -679,13 +699,17 @@ internal class FrameDecoder(
                 // 複数のパスの係数は整数で足し合わせてから、一度だけ浮動小数点にする
                 gs!!.intCoeffs?.let { ints ->
                     for (c in 0 until 3) {
-                        val n = ((gbw shr hShift[c]) * 8) * ((gbh shr vShift[c]) * 8)
+                        val cw = (gbw shr hShift[c]) * 8
+                        val chh = (gbh shr vShift[c]) * 8
                         val src = ints[c]
-                        val dst = gs.coeffs[c]
-                        for (i in 0 until n) dst[i] = src[i].toFloat()
+                        val dst = gs.out[c]!!
+                        for (y in 0 until chh) {
+                            val r = gs.outBase[c] + y * gs.outStride[c]
+                            for (x in 0 until cw) dst[r + x] = src[y * cw + x].toFloat()
+                        }
                     }
                 }
-                reconstructGroup(gx, gy, gbw, gbh, gs, target, targetY0)
+                reconstructGroup(gx, gy, gbw, gbh, gs)
             }
         } finally {
             gs?.recycle()
@@ -693,13 +717,16 @@ internal class FrameDecoder(
     }
 
     /**
-     * グループの係数と逆変換の作業領域。グループごと・フレームごとに確保せず、[ScratchPool] に置いて使い回す。
-     * パスが 1 つなら、量子化された係数 (整数) を浮動小数点の配列に直接書き、その場で逆量子化する
+     * グループの逆変換の作業領域。グループごと・フレームごとに確保せず、[ScratchPool] に置いて使い回す。
+     * 係数は書き込み先 ([out] の [outBase] から、行の長さ [outStride]) のグループの場所に直接置き、その場で逆変換する。
+     * パスが 1 つなら、量子化された係数 (整数) を読んだその場で逆量子化して書く
      * (各係数は一度だけ書かれるので、整数から変換するのと同じ値になる)。
-     * 複数のパスがあるときは [intCoeffs] に整数で足し合わせる
+     * 複数のパスがあるときは [intCoeffs] (グループの幅を行の長さとする) に整数で足し合わせる
      */
-    private class GroupScratch(size: Int, multiPass: Boolean) {
-        val coeffs = Array(3) { FloatArray(size) }
+    private class GroupScratch(val size: Int, multiPass: Boolean) {
+        val out = arrayOfNulls<FloatArray>(3)
+        val outBase = IntArray(3)
+        val outStride = IntArray(3)
         val intCoeffs: Array<IntArray>? = if (multiPass) Array(3) { IntArray(size) } else null
         /**
          * ブロック (チャンネルごと、グループ内のブロック座標 y * 幅 + x) の HF 係数のうち 0 でないものがある行の数
@@ -711,19 +738,21 @@ internal class FrameDecoder(
         val lfBuf = FloatArray(32 * 32)
         val dct = Dct.Scratch()
 
-        fun recycle() = ScratchPool.give(this, coeffs[0].size * (if (intCoeffs != null) 24L else 12L) + 8192L + dct.cols.bytes())
+        fun recycle() {
+            out.fill(null)
+            ScratchPool.give(this, size * (if (intCoeffs != null) 12L else 0L) + size * 3L / 16 + 8192L + dct.cols.bytes())
+        }
 
         companion object {
             fun obtain(size: Int, multiPass: Boolean): GroupScratch =
                 ScratchPool.take(GroupScratch::class.java) {
                     // 大きすぎるもの (大きいグループ用) を小さい画像に使わない
-                    it.coeffs[0].size >= size && it.coeffs[0].size / 4 <= size && (!multiPass || it.intCoeffs != null)
+                    it.size >= size && it.size / 4 <= size && (!multiPass || it.intCoeffs != null)
                 } ?: GroupScratch(size, multiPass)
         }
     }
 
     private fun decodeHfCoefficients(br: BitReader, pass: Int, gx: Int, gy: Int, gbw: Int, gbh: Int, gs: GroupScratch) {
-        val outF = gs.coeffs
         val outI = gs.intCoeffs
         val nzRows = gs.nzRows
         val ctx = lfGlobal.blockCtx!!
@@ -808,7 +837,9 @@ internal class FrameDecoder(
                         if (sx + dx < nzr.size) nzr[sx + dx] = nzVal
                     }
                     if (nonZeros == 0) continue
-                    val coeffF = outF[c]
+                    val coeffF = gs.out[c]!!
+                    val fBase = gs.outBase[c] + sy * 8 * gs.outStride[c] + sx * 8
+                    val fStride = gs.outStride[c]
                     val coeffI = outI?.get(c)
                     val cw = (gbw shr hs) * 8
                     var prevNz = if (nonZeros <= numBlocks * 4) 1 else 0
@@ -841,14 +872,13 @@ internal class FrameDecoder(
                         if (transpose) {
                             val tmp = dx; dx = dy; dy = tmp
                         }
-                        val ci = (sy * 8 + dy) * cw + sx * 8 + dx
                         if (coeffI != null) {
-                            coeffI[ci] += v
+                            coeffI[(sy * 8 + dy) * cw + sx * 8 + dx] += v
                         } else {
                             // 各係数は一度だけ書かれるので、整数のまま足し合わせてから逆量子化するのと同じ値になる
                             val q = v.toFloat()
                             val dq = if (q == 1f || q == -1f) q * qbc else q - qbn / q
-                            coeffF[ci] = dq * m[dy * bwv + dx] * scale
+                            coeffF[fBase + dy * fStride + dx] = dq * m[dy * bwv + dx] * scale
                         }
                         if (dy >= rows) rows = dy + 1
                         prevNz = 1
@@ -865,29 +895,25 @@ internal class FrameDecoder(
         reader.finish()
     }
 
-    /** 逆量子化・CfL・逆 DCT をして色平面に書き込む */
-    private fun reconstructGroup(
-        gx: Int, gy: Int, gbw: Int, gbh: Int, gs: GroupScratch, target: Array<FloatArray>?, targetY0: Int,
-    ) {
-        val coeffs = gs.coeffs
+    /** 書き込み先に置いた係数を逆量子化 (複数パスのとき)・CfL・逆 DCT する */
+    private fun reconstructGroup(gx: Int, gy: Int, gbw: Int, gbh: Int, gs: GroupScratch) {
         val qm = quantMatrices!!
         val bx0 = gx * (gd / 8)
         val by0 = gy * (gd / 8)
         val qmScale = qmScales()
-        val fcoeff = coeffs
         val qb = image.quantBias
         val qbn = image.quantBiasNumerator
         // パスが 1 つなら係数は読んだときに逆量子化してある
         if (gs.intCoeffs != null) for (c in 0 until 3) {
-            val cw = (gbw shr hShift[c]) * 8
-            val dst = coeffs[c]
+            val stride = gs.outStride[c]
+            val dst = gs.out[c]!!
             forEachVarblock(c, gbw, gbh, bx0, by0) { sx, sy, t, mul ->
                 val bwv = Tt.BW[t] * 8
                 val bhv = Tt.BH[t] * 8
                 val m = qm.get(t, c)
                 val scale = 65536f / (lfGlobal.globalScale.toFloat() * mul) * qmScale[c]
                 for (yy in 0 until bhv) {
-                    val row = (sy * 8 + yy) * cw + sx * 8
+                    val row = gs.outBase[c] + (sy * 8 + yy) * stride + sx * 8
                     val mrow = yy * bwv
                     for (xx in 0 until bwv) {
                         val qf = dst[row + xx]
@@ -902,9 +928,15 @@ internal class FrameDecoder(
         if (maxHs == 0 && maxVs == 0) {
             val cw = gbw * 8
             val ch = gbh * 8
-            val fx = fcoeff[0]
-            val fy = fcoeff[1]
-            val fb = fcoeff[2]
+            val fx = gs.out[0]!!
+            val fy = gs.out[1]!!
+            val fb = gs.out[2]!!
+            // サブサンプリングがなければ 3 チャンネルとも同じ位置・行の長さ
+            val o0 = gs.outBase[0]
+            val stride = gs.outStride[0]
+            if (gs.outBase[1] != o0 || gs.outBase[2] != o0 || gs.outStride[1] != stride || gs.outStride[2] != stride) {
+                error("channel layout mismatch")
+            }
             val tx0 = gx * gd / 64
             val ty0 = gy * gd / 64
             val cf = lfGlobal.colourFactor.toFloat()
@@ -915,7 +947,7 @@ internal class FrameDecoder(
                     val kx = lfGlobal.baseCorrX + xFromY[ti] / cf
                     val kb = lfGlobal.baseCorrB + bFromY[ti] / cf
                     val xEnd = minOf(cw, x64 * 64 + 64)
-                    val row = y * cw
+                    val row = o0 + y * stride
                     for (x in x64 * 64 until xEnd) {
                         val yv = fy[row + x]
                         fx[row + x] += kx * yv
@@ -929,8 +961,9 @@ internal class FrameDecoder(
         val tmp = gs.tmp
         val lfBuf = gs.lfBuf
         for (c in 0 until 3) {
-            val cw = (gbw shr hShift[c]) * 8
-            val buf = fcoeff[c]
+            val cw = gs.outStride[c]
+            val buf = gs.out[c]!!
+            val o0 = gs.outBase[c]
             val lf = lfPlanes[c]
             val lbx0 = bx0 shr hShift[c]
             val lby0 = by0 shr vShift[c]
@@ -941,7 +974,7 @@ internal class FrameDecoder(
             forEachVarblock(c, gbw, gbh, bx0, by0) { sx, sy, t, _ ->
                 val bwb = Tt.BW[t]
                 val bhb = Tt.BH[t]
-                val base = (sy * 8) * cw + sx * 8
+                val base = o0 + (sy * 8) * cw + sx * 8
                 val nz = maxOf(nzRows[sy * bwc + sx], nzY[sy * bwc + sx])
                 if (bwb == 1 && bhb == 1) {
                     buf[base] = lf.data[(lby0 + sy) * lf.width + lbx0 + sx]
@@ -967,19 +1000,6 @@ internal class FrameDecoder(
                     Tt.DCT8 -> if (nz == 0) Dct.fill8x8(buf, base, cw) else Dct.idct8x8(buf, base, cw, nz, scratch)
                     // 0 でない係数があるのは上から max(LF の行数, nz) 行だけ
                     else -> Dct.idct2d(buf, base, cw, bwb * 8, bhb * 8, maxOf(bhb, nz), scratch, gs.dct.cols)
-                }
-            }
-            // 色平面へ
-            val px0 = (bx0 shr hShift[c]) * 8
-            val py0 = (by0 shr vShift[c]) * 8
-            val chh = (gbh shr vShift[c]) * 8
-            if (target != null) {
-                val stride = bw * 8
-                for (y in 0 until chh) System.arraycopy(buf, y * cw, target[c], (py0 - targetY0 + y) * stride + px0, cw)
-            } else {
-                val plane = colorPlanes!![c]
-                for (y in 0 until chh) {
-                    System.arraycopy(buf, y * cw, plane.data, (py0 + y) * plane.width + px0, cw)
                 }
             }
         }
