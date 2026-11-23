@@ -1293,14 +1293,9 @@ internal class FrameDecoder(
         val xb = minOf(w, outW - ox)
         val gab = header.gabor
         val epf = header.epf
-        val epfSteps = when (epf?.iters) {
-            null -> IntArray(0)
-            1 -> intArrayOf(1)
-            2 -> intArrayOf(1, 2)
-            else -> intArrayOf(0, 1, 2)
-        }
-        val epfRadius = IntArray(epfSteps.size) { when (epfSteps[it]) { 0 -> 3; 1 -> 2; else -> 1 } }
-        val epfHalo = epfRadius.sum()
+        val epfSteps = Filters.epfSteps(epf)
+        var epfHalo = 0
+        for (st in epfSteps) epfHalo += Filters.epfRadius(st)
         val halo = epfHalo + (if (gab != null) 1 else 0)
         val alphaIdx = image.alphaChannel
         // 変換のある Modular 画像では、アルファは最後に逆変換してから書き込む (それまでは不透明として描く)
@@ -1324,7 +1319,7 @@ internal class FrameDecoder(
         fun idctOff(y: Int) = if (y >= curY0) (y - curY0) * stride else (y - (curY0 - carryRows)) * stride
 
         // Gaborish 後の行 (y は鏡映済みでなくてよい)
-        val inputRow: (Int, Int, FloatArray, Int) -> Unit = { c, yy, dst, off ->
+        val inputRow = Filters.RowSource { c, yy, dst, off ->
             val y = Filters.mirror(yy, h)
             val src = idctRow(c, y)
             val o = idctOff(y)
@@ -1366,91 +1361,76 @@ internal class FrameDecoder(
         val grey = image.colourEncoding.colourSpace == ColourSpace.GREY
         val alphaScale = alphaDepth?.scale() ?: 0f
 
-        // 帯の作業領域は ScratchPool から取り、帯ごと・フレームごとに確保し直さない
         val threads = if (executor == null) 1 else Runtime.getRuntime().availableProcessors()
         val rs = w + 6
-        val band = (BAND_PIXELS / w).coerceIn(16, 64)
 
-        fun finalizeBand(y0: Int, y1: Int, sc: Filters.EpfScratch) {
-            // 帯の行 y0..y1 の色 (XYB)。画素 (x, y) は rows[c][(y - lo) * rs + x + 3]
-            val rows: Array<FloatArray>
-            val lo: Int
-            if (epf != null) {
-                Filters.epfBand(inputRow, y0, y1, w, h, epfHalo, epfSteps, epfRadius, epf, epfSigma, bw, sc)
-                rows = sc.result
-                lo = sc.resultLo
-            } else {
-                sc.ensure((y1 - y0) * rs)
-                rows = sc.a
-                lo = y0
-                for (c in 0 until 3) for (y in y0 until y1) inputRow(c, y, rows[c], (y - y0) * rs + 3)
-            }
-            lfGlobal.patches?.let { applyPatchesToBand(it, rows, rs, lo, y0, y1, w, h) }
-            val rx = rows[0]
-            val ry = rows[1]
-            val rb = rows[2]
-            for (y in y0 until y1) {
-                val ty = y + oy
-                if (ty < 0 || ty >= outH) continue
-                val ro = (y - lo) * rs + 3
-                val oo = y * w
-                val to = ty * outW + ox
-                for (x in xa until xb) {
-                    val i = ro + x
-                    val gl = ry[i] + rx[i] - cb0
-                    val gm = ry[i] - rx[i] - cb1
-                    val gs = rb[i] - cb2
-                    val ml = (gl * gl * gl + ob[0]) * its
-                    val mm = (gm * gm * gm + ob[1]) * its
-                    val ms = (gs * gs * gs + ob[2]) * its
-                    var r = m[0] * ml + m[1] * mm + m[2] * ms
-                    var g = m[3] * ml + m[4] * mm + m[5] * ms
-                    var bb = m[6] * ml + m[7] * mm + m[8] * ms
-                    if (grey) {
-                        val l = 0.2126f * r + 0.7152f * g + 0.0722f * bb
-                        r = l; g = l; bb = l
-                    }
-                    var av = 1f
-                    if (alpha != null) {
-                        val raw = alpha.data[oo + x]
-                        av = if (alphaDepth!!.isFloat) alphaDepth.parseFloatSample(raw) else raw * alphaScale
-                        if (av < 0f) av = 0f else if (av > 1f) av = 1f
-                    }
-                    if (premul) {
-                        var sr = ColorConvert.srgbEncodeFast(r)
-                        var sg = ColorConvert.srgbEncodeFast(g)
-                        var sb = ColorConvert.srgbEncodeFast(bb)
-                        if (av > 0f) {
-                            sr /= av; sg /= av; sb /= av
+        // 行 ta..tb を上から順に仕上げる (EPF は行ごとに計算し、その行をすぐ ARGB にする)
+        fun finalizeRows(ta: Int, tb: Int) {
+            val ep = Filters.EpfRows.obtain()
+            try {
+                ep.begin(inputRow, w, h, epfSteps, epf, epfSigma, bw, ta)
+                val rows = Array(3) { ep.out(it) }
+                val rx = rows[0]
+                val ry = rows[1]
+                val rb = rows[2]
+                for (y in ta until tb) {
+                    val o = ep.row(y)
+                    // パッチは行 y の帯として重ねる (帯の先頭の行 lo は、配列の中の位置 o が (y - lo) * rs になる行)
+                    lfGlobal.patches?.let { applyPatchesToBand(it, rows, rs, y - o / rs, y, y + 1, w, h) }
+                    val ty = y + oy
+                    if (ty < 0 || ty >= outH) continue
+                    val ro = o + 3
+                    val oo = y * w
+                    val to = ty * outW + ox
+                    for (x in xa until xb) {
+                        val i = ro + x
+                        val gl = ry[i] + rx[i] - cb0
+                        val gm = ry[i] - rx[i] - cb1
+                        val gs = rb[i] - cb2
+                        val ml = (gl * gl * gl + ob[0]) * its
+                        val mm = (gm * gm * gm + ob[1]) * its
+                        val ms = (gs * gs * gs + ob[2]) * its
+                        var r = m[0] * ml + m[1] * mm + m[2] * ms
+                        var g = m[3] * ml + m[4] * mm + m[5] * ms
+                        var bb = m[6] * ml + m[7] * mm + m[8] * ms
+                        if (grey) {
+                            val l = 0.2126f * r + 0.7152f * g + 0.0722f * bb
+                            r = l; g = l; bb = l
                         }
-                        out[to + x] = (to8(av) shl 24) or (to8(sr) shl 16) or (to8(sg) shl 8) or to8(sb)
-                    } else {
-                        out[to + x] = (to8(av) shl 24) or (ColorConvert.linearToSrgb8(r) shl 16) or
-                            (ColorConvert.linearToSrgb8(g) shl 8) or ColorConvert.linearToSrgb8(bb)
+                        var av = 1f
+                        if (alpha != null) {
+                            val raw = alpha.data[oo + x]
+                            av = if (alphaDepth!!.isFloat) alphaDepth.parseFloatSample(raw) else raw * alphaScale
+                            if (av < 0f) av = 0f else if (av > 1f) av = 1f
+                        }
+                        if (premul) {
+                            var sr = ColorConvert.srgbEncodeFast(r)
+                            var sg = ColorConvert.srgbEncodeFast(g)
+                            var sb = ColorConvert.srgbEncodeFast(bb)
+                            if (av > 0f) {
+                                sr /= av; sg /= av; sb /= av
+                            }
+                            out[to + x] = (to8(av) shl 24) or (to8(sr) shl 16) or (to8(sg) shl 8) or to8(sb)
+                        } else {
+                            out[to + x] = (to8(av) shl 24) or (ColorConvert.linearToSrgb8(r) shl 16) or
+                                (ColorConvert.linearToSrgb8(g) shl 8) or ColorConvert.linearToSrgb8(bb)
+                        }
                     }
                 }
+            } finally {
+                ep.recycle()
             }
         }
 
         fun finalize(a: Int, b: Int) {
             if (a >= b) return
-            // スレッドごとに連続した行をまとめて受け持ち、その中を最大 band 行の帯に分ける
+            // スレッドごとに連続した行をまとめて受け持つ (受け持ちの境目だけ EPF の重なりを計算し直す)
             val tasks = maxOf(1, minOf(threads, (b - a + 15) / 16))
             val per = (b - a + tasks - 1) / tasks
             parallelFor(executor, tasks) { k ->
-                val sc = Filters.EpfScratch.obtain()
-                try {
-                    val ta = a + k * per
-                    val tb = minOf(b, ta + per)
-                    var y0 = ta
-                    while (y0 < tb) {
-                        val y1 = minOf(tb, y0 + band)
-                        finalizeBand(y0, y1, sc)
-                        y0 = y1
-                    }
-                } finally {
-                    sc.recycle()
-                }
+                val ta = a + k * per
+                val tb = minOf(b, ta + per)
+                if (ta < tb) finalizeRows(ta, tb)
             }
         }
 
@@ -1550,12 +1530,6 @@ internal class FrameDecoder(
 
     companion object {
         val TIMING = System.getenv("JXL_TIMING") != null
-
-        /**
-         * 逐次描画で一度に仕上げる帯の画素数の目安。帯が高いほど EPF の重なりの再計算が減るが、
-         * スレッドごとの作業領域が増えるので、幅に応じて 16〜64 行にする
-         */
-        private const val BAND_PIXELS = 64 * 1024
 
         fun to8(v: Float): Int {
             val f = v * 255f + 0.5f
