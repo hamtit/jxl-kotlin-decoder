@@ -1398,6 +1398,18 @@ internal class FrameDecoder(
         val cb2 = Math.cbrt(ob[2].toDouble()).toFloat()
         val its = 255f / image.toneMapping.intensityTarget
         val m = image.opsinInverseMatrix
+        val ob0 = ob[0]
+        val ob1 = ob[1]
+        val ob2 = ob[2]
+        val m0 = m[0]
+        val m1 = m[1]
+        val m2 = m[2]
+        val m3 = m[3]
+        val m4 = m[4]
+        val m5 = m[5]
+        val m6 = m[6]
+        val m7 = m[7]
+        val m8 = m[8]
         val grey = image.colourEncoding.colourSpace == ColourSpace.GREY
         val alphaScale = alphaDepth?.scale() ?: 0f
 
@@ -1410,6 +1422,9 @@ internal class FrameDecoder(
             try {
                 ep.begin(inputRow, w, h, epfSteps, epf, epfSigma, bw, ta)
                 val rows = Array(3) { ep.out(it) }
+                val lr = FloatArray(w)
+                val lg = FloatArray(w)
+                val lb = FloatArray(w)
                 val rx = rows[0]
                 val ry = rows[1]
                 val rb = rows[2]
@@ -1422,28 +1437,28 @@ internal class FrameDecoder(
                     val ro = o + 3
                     val oo = y * w
                     val to = ty * outW + ox
-                    for (x in xa until xb) {
-                        val i = ro + x
-                        val gl = ry[i] + rx[i] - cb0
-                        val gm = ry[i] - rx[i] - cb1
-                        val gs = rb[i] - cb2
-                        val ml = (gl * gl * gl + ob[0]) * its
-                        val mm = (gm * gm * gm + ob[1]) * its
-                        val ms = (gs * gs * gs + ob[2]) * its
-                        var r = m[0] * ml + m[1] * mm + m[2] * ms
-                        var g = m[3] * ml + m[4] * mm + m[5] * ms
-                        var bb = m[6] * ml + m[7] * mm + m[8] * ms
-                        if (grey) {
-                            val l = 0.2126f * r + 0.7152f * g + 0.0722f * bb
-                            r = l; g = l; bb = l
-                        }
-                        var av = 1f
-                        if (alpha != null) {
-                            val raw = alpha.data[oo + x]
-                            av = if (alphaDepth!!.isFloat) alphaDepth.parseFloatSample(raw) else raw * alphaScale
-                            if (av < 0f) av = 0f else if (av > 1f) av = 1f
-                        }
-                        if (premul) {
+                    if (premul) {
+                        for (x in xa until xb) {
+                            val i = ro + x
+                            val gl = ry[i] + rx[i] - cb0
+                            val gm = ry[i] - rx[i] - cb1
+                            val gs = rb[i] - cb2
+                            val ml = (gl * gl * gl + ob[0]) * its
+                            val mm = (gm * gm * gm + ob[1]) * its
+                            val ms = (gs * gs * gs + ob[2]) * its
+                            var r = m[0] * ml + m[1] * mm + m[2] * ms
+                            var g = m[3] * ml + m[4] * mm + m[5] * ms
+                            var bb = m[6] * ml + m[7] * mm + m[8] * ms
+                            if (grey) {
+                                val l = 0.2126f * r + 0.7152f * g + 0.0722f * bb
+                                r = l; g = l; bb = l
+                            }
+                            var av = 1f
+                            if (alpha != null) {
+                                val raw = alpha.data[oo + x]
+                                av = if (alphaDepth!!.isFloat) alphaDepth.parseFloatSample(raw) else raw * alphaScale
+                                if (av < 0f) av = 0f else if (av > 1f) av = 1f
+                            }
                             var sr = ColorConvert.srgbEncodeFast(r)
                             var sg = ColorConvert.srgbEncodeFast(g)
                             var sb = ColorConvert.srgbEncodeFast(bb)
@@ -1451,9 +1466,54 @@ internal class FrameDecoder(
                                 sr /= av; sg /= av; sb /= av
                             }
                             out[to + x] = (to8(av) shl 24) or (to8(sr) shl 16) or (to8(sg) shl 8) or to8(sb)
-                        } else {
-                            out[to + x] = (to8(av) shl 24) or (ColorConvert.linearToSrgb8(r) shl 16) or
-                                (ColorConvert.linearToSrgb8(g) shl 8) or ColorConvert.linearToSrgb8(bb)
+                        }
+                        continue
+                    }
+                    // XYB から線形 RGB への変換 (分岐のない計算なので自動ベクトル化が効く) と、
+                    // 8 ビットへの変換 (表を引く) を別のループにする
+                    if (grey) {
+                        for (x in xa until xb) {
+                            val i = ro + x
+                            val gl = ry[i] + rx[i] - cb0
+                            val gm = ry[i] - rx[i] - cb1
+                            val gs = rb[i] - cb2
+                            val ml = (gl * gl * gl + ob0) * its
+                            val mm = (gm * gm * gm + ob1) * its
+                            val ms = (gs * gs * gs + ob2) * its
+                            val r = m0 * ml + m1 * mm + m2 * ms
+                            val g = m3 * ml + m4 * mm + m5 * ms
+                            val bb = m6 * ml + m7 * mm + m8 * ms
+                            val l = 0.2126f * r + 0.7152f * g + 0.0722f * bb
+                            lr[x] = l
+                            lg[x] = l
+                            lb[x] = l
+                        }
+                    } else {
+                        for (x in xa until xb) {
+                            val i = ro + x
+                            val gl = ry[i] + rx[i] - cb0
+                            val gm = ry[i] - rx[i] - cb1
+                            val gs = rb[i] - cb2
+                            val ml = (gl * gl * gl + ob0) * its
+                            val mm = (gm * gm * gm + ob1) * its
+                            val ms = (gs * gs * gs + ob2) * its
+                            lr[x] = m0 * ml + m1 * mm + m2 * ms
+                            lg[x] = m3 * ml + m4 * mm + m5 * ms
+                            lb[x] = m6 * ml + m7 * mm + m8 * ms
+                        }
+                    }
+                    if (alpha == null) {
+                        for (x in xa until xb) {
+                            out[to + x] = (255 shl 24) or (ColorConvert.linearToSrgb8(lr[x]) shl 16) or
+                                (ColorConvert.linearToSrgb8(lg[x]) shl 8) or ColorConvert.linearToSrgb8(lb[x])
+                        }
+                    } else {
+                        for (x in xa until xb) {
+                            val raw = alpha.data[oo + x]
+                            var av = if (alphaDepth!!.isFloat) alphaDepth.parseFloatSample(raw) else raw * alphaScale
+                            if (av < 0f) av = 0f else if (av > 1f) av = 1f
+                            out[to + x] = (to8(av) shl 24) or (ColorConvert.linearToSrgb8(lr[x]) shl 16) or
+                                (ColorConvert.linearToSrgb8(lg[x]) shl 8) or ColorConvert.linearToSrgb8(lb[x])
                         }
                     }
                 }
