@@ -21,19 +21,51 @@ internal object ColorConvert {
         return p / q
     }
 
-    /** 線形 (0..1 を 65535 段階) から 8 ビットの sRGB への変換表 (丸めも含む) */
-    private val SRGB8_LUT = ByteArray(65536) {
-        val v = it / 65535.0
+    /*
+     * 線形の値から 8 ビットの sRGB への変換表。2^-16 .. 1 の値を、浮動小数点のビット列の指数と仮数の上位 7 ビットで
+     * 区間に分け、区間の始まりの出力 (下位 8 ビット) と、出力が 1 増える値のビット列 (上位) を 1 つの Long に持つ。
+     * どの区間も出力の幅が 1 未満なので、比べるのは 1 回で済み、正確に四捨五入できる。
+     * 2^-16 未満は 0 になる (2^-16 * 12.92 * 255 < 0.5)。
+     */
+    private val SRGB_MIN_BITS = java.lang.Float.floatToRawIntBits(1f / 65536f)
+    private val SRGB_ONE_BITS = java.lang.Float.floatToRawIntBits(1f)
+    private val SRGB_TABLE = LongArray((SRGB_ONE_BITS - SRGB_MIN_BITS) ushr 16)
+
+    private fun srgbExact8(v: Double): Int {
         val e = if (v <= 0.0031308) v * 12.92 else 1.055 * Math.pow(v, 1.0 / 2.4) - 0.055
-        Math.round(e * 255.0).toInt().coerceIn(0, 255).toByte()
+        return Math.round(e * 255.0).toInt().coerceIn(0, 255)
     }
 
-    /** 線形の値を 8 ビットの sRGB にする */
+    init {
+        for (i in SRGB_TABLE.indices) {
+            val loBits = SRGB_MIN_BITS + (i shl 16)
+            val hiBits = loBits + (1 shl 16)
+            val base = srgbExact8(Float.fromBits(loBits).toDouble())
+            // 出力が base + 1 になる最小の値のビット列 (区間の中に無ければ届かない値)。区間の中を二分探索する
+            var step = Int.MAX_VALUE
+            if (srgbExact8(Float.fromBits(hiBits - 1).toDouble()) > base) {
+                var lo = loBits
+                var hi = hiBits - 1
+                while (lo < hi) {
+                    val mid = (lo + hi) ushr 1
+                    if (srgbExact8(Float.fromBits(mid).toDouble()) > base) hi = mid else lo = mid + 1
+                }
+                step = lo
+            }
+            check(srgbExact8(Float.fromBits(hiBits - 1).toDouble()) <= base + 1)
+            SRGB_TABLE[i] = (step.toLong() shl 8) or base.toLong()
+        }
+    }
+
+    /** 線形の値を 8 ビットの sRGB にする (sRGB の伝達関数をかけて四捨五入。0..1 の外は切り詰める) */
     fun linearToSrgb8(v: Float): Int {
-        val f = v * 65535f + 0.5f
-        if (!(f > 0f)) return 0
-        if (f >= 65535f) return 255
-        return SRGB8_LUT[f.toInt()].toInt() and 0xff
+        val bits = java.lang.Float.floatToRawIntBits(v)
+        // 負の値 (符号ビットで負の整数になる) と 2^-16 未満は 0、1 以上は 255 (NaN は 0)
+        if (bits < SRGB_MIN_BITS) return 0
+        if (bits >= SRGB_ONE_BITS) return if (bits > 0x7f800000) 0 else 255
+        val e = SRGB_TABLE[(bits - SRGB_MIN_BITS) ushr 16]
+        // bits >= 出力が増える値 なら 1 足す (分岐しない)
+        return (e.toInt() and 0xff) + (((e ushr 8).toInt() - 1 - bits) ushr 31)
     }
 
     /** XYB を sRGB (伝達関数適用済み、0..1 付近) に変換する */
