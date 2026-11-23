@@ -1,0 +1,3 @@
+{
+  "install": "./gradlew --no-daemon compileTestKotlin :cli:installDist"
+}
