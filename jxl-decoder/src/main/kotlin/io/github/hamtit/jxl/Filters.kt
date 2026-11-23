@@ -303,9 +303,20 @@ internal object Filters {
             forActiveRuns(r - 1, r + 2) { xs, xe ->
                 val x0 = maxOf(h0, xs + 1)
                 val x1 = minOf(h1, xe + 4)
-                for (x in x0 until x1) {
-                    hd[lb + x] = s0 * kotlin.math.abs(p0[a + x + 1] - p0[a + x]) + s1 * kotlin.math.abs(p1[a + x + 1] - p1[a + x]) +
-                        s2 * kotlin.math.abs(p2[a + x + 1] - p2[a + x])
+                // 右隣の値は次の画素の値になるので、変数で持ち回る
+                if (x0 < x1) {
+                    var c0 = p0[a + x0]
+                    var c1 = p1[a + x0]
+                    var c2 = p2[a + x0]
+                    for (x in x0 until x1) {
+                        val r0 = p0[a + x + 1]
+                        val r1 = p1[a + x + 1]
+                        val r2 = p2[a + x + 1]
+                        hd[lb + x] = s0 * kotlin.math.abs(r0 - c0) + s1 * kotlin.math.abs(r1 - c1) + s2 * kotlin.math.abs(r2 - c2)
+                        c0 = r0
+                        c1 = r1
+                        c2 = r2
+                    }
                 }
                 for (x in maxOf(h0 + 1, x0) until x1) {
                     vd[lb + x] = s0 * kotlin.math.abs(p0[b + x] - p0[a + x]) + s1 * kotlin.math.abs(p1[b + x] - p1[a + x]) +
@@ -426,18 +437,40 @@ internal object Filters {
                     if (xEnd - runEnd == 8) nisRow[runEnd + 7] = nisBorder
                     runEnd = xEnd
                 }
-                for (x in bx until runEnd) {
-                    val ni = nisRow[x]
-                    val li = x + 3
-                    val wr = maxOf(0f, 1f + sh[sho + li] * ni)
-                    val wl = maxOf(0f, 1f + sh[sho + li - 1] * ni)
-                    val wd = maxOf(0f, 1f + sv[svo + li] * ni)
-                    val wu = maxOf(0f, 1f + sv[svu + li] * ni)
-                    val inv = 1f / (1f + wr + wl + wd + wu)
-                    val oi = o + li
-                    o0[oi] = (i0[pm + li] + wr * i0[pm + li + 1] + wl * i0[pm + li - 1] + wd * i0[pd + li] + wu * i0[pu + li]) * inv
-                    o1[oi] = (i1[pm + li] + wr * i1[pm + li + 1] + wl * i1[pm + li - 1] + wd * i1[pd + li] + wu * i1[pu + li]) * inv
-                    o2[oi] = (i2[pm + li] + wr * i2[pm + li + 1] + wl * i2[pm + li - 1] + wd * i2[pd + li] + wu * i2[pu + li]) * inv
+                // 同じ行の左・中央・右の値と右の差分は、次の画素で左・中央・左の差分になるので変数で持ち回る
+                if (bx < runEnd) {
+                    var l0 = i0[pm + bx + 2]
+                    var l1 = i1[pm + bx + 2]
+                    var l2 = i2[pm + bx + 2]
+                    var c0 = i0[pm + bx + 3]
+                    var c1 = i1[pm + bx + 3]
+                    var c2 = i2[pm + bx + 3]
+                    var dl = sh[sho + bx + 2]
+                    for (x in bx until runEnd) {
+                        val ni = nisRow[x]
+                        val li = x + 3
+                        val dr = sh[sho + li]
+                        val r0 = i0[pm + li + 1]
+                        val r1 = i1[pm + li + 1]
+                        val r2 = i2[pm + li + 1]
+                        // max(0, v)。NaN はそのまま (maxOf と同じ)、-0 は 0 と違うが足し算の結果は変わらない
+                        val vr = 1f + dr * ni
+                        val vl = 1f + dl * ni
+                        val vd = 1f + sv[svo + li] * ni
+                        val vu = 1f + sv[svu + li] * ni
+                        val wr = if (vr < 0f) 0f else vr
+                        val wl = if (vl < 0f) 0f else vl
+                        val wd = if (vd < 0f) 0f else vd
+                        val wu = if (vu < 0f) 0f else vu
+                        val inv = 1f / (1f + wr + wl + wd + wu)
+                        val oi = o + li
+                        o0[oi] = (c0 + wr * r0 + wl * l0 + wd * i0[pd + li] + wu * i0[pu + li]) * inv
+                        o1[oi] = (c1 + wr * r1 + wl * l1 + wd * i1[pd + li] + wu * i1[pu + li]) * inv
+                        o2[oi] = (c2 + wr * r2 + wl * l2 + wd * i2[pd + li] + wu * i2[pu + li]) * inv
+                        l0 = c0; l1 = c1; l2 = c2
+                        c0 = r0; c1 = r1; c2 = r2
+                        dl = dr
+                    }
                 }
                 // 平滑化しないブロック (sigma が小さい) はそのまま写す
                 bx = runEnd

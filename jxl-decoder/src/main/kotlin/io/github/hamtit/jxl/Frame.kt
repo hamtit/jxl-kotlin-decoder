@@ -1451,12 +1451,13 @@ internal class FrameDecoder(
         val grey = image.colourEncoding.colourSpace == ColourSpace.GREY
         val alphaScale = alphaDepth?.scale() ?: 0f
 
-        // グループの逆 DCT 後の値は、上に BORDER 行の余白を付けたタイル (行の長さ gd、gd + BORDER 行) に置く。
-        // タイルの (0, 0) は画像の (x0, y0 - BORDER)。上の余白は前のグループ行の下端から写す。
+        // グループの逆 DCT 後の値は、上と左に BORDER 画素の余白を付けたタイル (行の長さ ts、gd + BORDER 行) に置く。
+        // タイルの (0, 0) は画像の (x0 - BORDER, y0 - BORDER)。上の余白は前のグループ行の下端から写す。
+        // 左の余白は、左のグループの復号が先に済んでいたときだけ (継ぎ目の配列から) 写し、継ぎ目も一緒に描く。
         // 各グループは、描く範囲 (自分の領域を左上に SHIFT 画素ずらしたもの) のうち、左のグループとの継ぎ目
         // (x0 - SHIFT .. x0 + SHIFT) 以外を自分のタイルだけで描き、タイルはすぐに返す。継ぎ目は、左右のグループの
         // 端の BORDER 列ずつを写した幅 2 * BORDER の小さな配列から、両方の復号を終えた方のスレッドが描く
-        val ts = gd
+        val ts = gd + BORDER
         val gpr = header.groupsPerRow
         val rowsOfGroups = header.groupsPerColumn
         val sw = bw * 8
@@ -1658,7 +1659,7 @@ internal class FrameDecoder(
             val gh = minOf(gd, bh * 8 - y0)
             val t = Array(3) { ScratchPool.floats(ts * (gd + BORDER)) }
             try {
-                decodeGroup(gy * gpr + gx, t, ts, x0, y0 - BORDER)
+                decodeGroup(gy * gpr + gx, t, ts, x0 - BORDER, y0 - BORDER)
                 // 左右の継ぎ目に写す列 (上の余白の行を含む)。左の継ぎ目には自分の左端、右の継ぎ目には右端
                 val left = if (gx > 0) seamOf(gx) else null
                 val right = if (gx < gpr - 1) seamOf(gx + 1) else null
@@ -1667,31 +1668,41 @@ internal class FrameDecoder(
                     // 上の余白は前のグループ行の下端
                     if (gy > 0) {
                         val rs = rowStrip[(gy - 1) and 1][c]
-                        for (r in 0 until BORDER) System.arraycopy(rs, r * sw + x0, d, r * ts, gw)
+                        for (r in 0 until BORDER) System.arraycopy(rs, r * sw + x0, d, r * ts + BORDER, gw)
                     }
                     // 継ぎ目に写す列は gw 以上あるとは限らない (右端の狭いグループ) が、写した先の余分な列は使わない
                     if (left != null) {
                         val sc = left[c]
-                        for (r in 0 until BORDER + gh) System.arraycopy(d, r * ts, sc, r * seamW + BORDER, BORDER)
+                        for (r in 0 until BORDER + gh) System.arraycopy(d, r * ts + BORDER, sc, r * seamW + BORDER, BORDER)
                     }
                     if (right != null) {
                         val sc = right[c]
-                        for (r in 0 until BORDER + gh) System.arraycopy(d, r * ts + gw - BORDER, sc, r * seamW, BORDER)
+                        for (r in 0 until BORDER + gh) System.arraycopy(d, r * ts + gw, sc, r * seamW, BORDER)
                     }
                     // 次のグループ行のために下端の BORDER 行を残す
                     if (gy < rowsOfGroups - 1) {
                         val rs = rowStrip[gy and 1][c]
-                        for (r in 0 until BORDER) System.arraycopy(d, (gh + r) * ts, rs, r * sw + x0, gw)
+                        for (r in 0 until BORDER) System.arraycopy(d, (gh + r) * ts + BORDER, rs, r * sw + x0, gw)
                     }
                 }
-                // 左右の継ぎ目は、両側の復号を終えた方が描く
-                if (gx > 0 && pending.decrementAndGet(gx) == 0) renderSeam(gx, gy)
+                // 左右の継ぎ目は、両側の復号を終えた方が描く。左の継ぎ目を自分が描くなら (1 スレッドでは常に)、
+                // 左のグループの右端をタイルの左の余白に写して、本体と一緒に描く (継ぎ目の上下の余白を計算し直さない)
+                val withLeft = gx > 0 && pending.decrementAndGet(gx) == 0
+                if (withLeft) {
+                    val sm = seams.getAndSet(gx, null)
+                    for (c in 0 until 3) {
+                        val sc = sm[c]
+                        val d = t[c]
+                        for (r in 0 until BORDER + gh) System.arraycopy(sc, r * seamW, d, r * ts, BORDER)
+                        ScratchPool.give(sc)
+                    }
+                }
                 if (gx < gpr - 1 && pending.decrementAndGet(gx + 1) == 0) renderSeam(gx + 1, gy)
-                val ax0 = if (gx == 0) 0 else x0 + SHIFT
+                val ax0 = if (gx == 0) 0 else if (withLeft) x0 - SHIFT else x0 + SHIFT
                 val ax1 = if (gx == gpr - 1) w else minOf(w, x0 + gd - SHIFT)
                 val ay0 = if (gy == 0) 0 else y0 - SHIFT
                 val ay1 = if (gy == rowsOfGroups - 1) h else minOf(h, y0 + gd - SHIFT)
-                render(t, ts, x0, y0 - BORDER, maxOf(0, ax0 - SHIFT), minOf(w, ax1 + SHIFT), ax0, ax1, ay0, ay1)
+                render(t, ts, x0 - BORDER, y0 - BORDER, maxOf(0, ax0 - SHIFT), minOf(w, ax1 + SHIFT), ax0, ax1, ay0, ay1)
             } finally {
                 for (c in 0 until 3) ScratchPool.give(t[c])
             }
