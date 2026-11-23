@@ -75,9 +75,6 @@ internal object Filters {
         return colors
     }
 
-    private val KERNEL0 = intArrayOf(0, -2, -1, -1, 0, -1, 1, -1, -2, 0, -1, 0, 1, 0, 2, 0, -1, 1, 0, 1, 1, 1, 0, 2)
-    private val DIST0 = intArrayOf(0, -1, 1, 0, 0, 0, -1, 0, 0, 1)
-
     /** EPF の段階 (0〜2) が上下に読む行数 */
     fun epfRadius(step: Int): Int = when (step) { 0 -> 3; 1 -> 2; else -> 1 }
 
@@ -168,32 +165,59 @@ internal object Filters {
             /** 次に計算する行 */
             var next = 0
 
-            // 段階 1・2: 右 (hd)・下 (vd) の画素との重み付き差分 (4 行の環状)
+            // 段階 0・1・2: 右 (hd)・下 (vd) の画素との重み付き差分 (4 行の環状)
             var hd = FloatArray(0)
             var vd = FloatArray(0)
             var rawNext = 0
 
-            // 段階 1: 差分の十字 (5 点) の和。hc は今の行だけ、vc は 4 行の環状
+            // 段階 0・1: 差分の十字 (5 点) の和。hc は今の行だけ、vc は 4 行の環状
             var hc = FloatArray(0)
             var vc = FloatArray(0)
             var vcNext = 0
 
+            // 段階 0 (12 近傍、対称な 6 方向の残り 4 方向): 右2 (h2)・下2 (v2)・右下 (dr)・左下 (dl)
+            var h2d = FloatArray(0)
+            var v2d = FloatArray(0)
+            var drd = FloatArray(0)
+            var dld = FloatArray(0)
+            var h2c = FloatArray(0)
+            var v2c = FloatArray(0)
+            var drc = FloatArray(0)
+            var dlc = FloatArray(0)
+
             fun ensure(pw: Int) {
                 val n = (mask + 1) * pw
                 if (rows[0].size < n) rows = Array(3) { FloatArray(n) }
-                if (step == 1 || step == 2) {
+                if (step >= 0) {
                     if (hd.size < 4 * pw) {
                         hd = FloatArray(4 * pw)
                         vd = FloatArray(4 * pw)
                     }
                 }
-                if (step == 1) {
+                if (step == 0 || step == 1) {
                     if (hc.size < pw) hc = FloatArray(pw)
                     if (vc.size < 4 * pw) vc = FloatArray(4 * pw)
                 }
+                if (step == 0) {
+                    if (h2d.size < 4 * pw) {
+                        h2d = FloatArray(4 * pw)
+                        v2d = FloatArray(4 * pw)
+                        drd = FloatArray(4 * pw)
+                        dld = FloatArray(4 * pw)
+                    }
+                    if (h2c.size < pw) h2c = FloatArray(pw)
+                    if (v2c.size < 4 * pw) {
+                        v2c = FloatArray(4 * pw)
+                        drc = FloatArray(4 * pw)
+                        dlc = FloatArray(4 * pw)
+                    }
+                }
             }
 
-            fun bytes(): Long = 4L * (3L * rows[0].size + hd.size + vd.size + hc.size + vc.size)
+            fun bytes(): Long = 4L * (
+                3L * rows[0].size + hd.size + vd.size + hc.size + vc.size +
+                    h2d.size + v2d.size + drd.size + dld.size + h2c.size + v2c.size + drc.size + dlc.size
+                )
         }
 
         private val stages = Array(4) { Stage() }
@@ -208,9 +232,6 @@ internal object Filters {
         /** 窓の左端のブロック列 (sigma の列の位置に足す) */
         private var xb0 = 0
         private var nis = FloatArray(0)
-        private val tapK = IntArray(12)
-        private val tapA = IntArray(60)
-        private val tapB = IntArray(60)
 
         /**
          * 行 [y0] から計算を始める。[steps] は EPF の段階の並び (空なら入力をそのまま返す)。
@@ -238,8 +259,12 @@ internal object Filters {
                 st.mask = if (k == n - 1) 0 else if (epfRadius(steps[k]) == 1) 3 else 7
                 st.ensure(pw)
                 st.next = start
-                st.rawNext = if (st.step == 1) start - 2 else start - 1
-                st.vcNext = start - 1
+                st.rawNext = when (st.step) {
+                    0 -> start - 3
+                    1 -> start - 2
+                    else -> start - 1
+                }
+                st.vcNext = if (st.step == 0) start - 2 else start - 1
                 if (k > 0) {
                     start -= epfRadius(st.step)
                     // EPF の段階は画像の中の行だけ計算する (外の行は鏡映)
@@ -303,20 +328,11 @@ internal object Filters {
             forActiveRuns(r - 1, r + 2) { xs, xe ->
                 val x0 = maxOf(h0, xs + 1)
                 val x1 = minOf(h1, xe + 4)
-                // 右隣の値は次の画素の値になるので、変数で持ち回る
-                if (x0 < x1) {
-                    var c0 = p0[a + x0]
-                    var c1 = p1[a + x0]
-                    var c2 = p2[a + x0]
-                    for (x in x0 until x1) {
-                        val r0 = p0[a + x + 1]
-                        val r1 = p1[a + x + 1]
-                        val r2 = p2[a + x + 1]
-                        hd[lb + x] = s0 * kotlin.math.abs(r0 - c0) + s1 * kotlin.math.abs(r1 - c1) + s2 * kotlin.math.abs(r2 - c2)
-                        c0 = r0
-                        c1 = r1
-                        c2 = r2
-                    }
+                for (x in x0 until x1) {
+                    val ax = a + x
+                    hd[lb + x] = s0 * kotlin.math.abs(p0[ax + 1] - p0[ax]) +
+                        s1 * kotlin.math.abs(p1[ax + 1] - p1[ax]) +
+                        s2 * kotlin.math.abs(p2[ax + 1] - p2[ax])
                 }
                 for (x in maxOf(h0 + 1, x0) until x1) {
                     vd[lb + x] = s0 * kotlin.math.abs(p0[b + x] - p0[a + x]) + s1 * kotlin.math.abs(p1[b + x] - p1[a + x]) +
@@ -437,40 +453,24 @@ internal object Filters {
                     if (xEnd - runEnd == 8) nisRow[runEnd + 7] = nisBorder
                     runEnd = xEnd
                 }
-                // 同じ行の左・中央・右の値と右の差分は、次の画素で左・中央・左の差分になるので変数で持ち回る
-                if (bx < runEnd) {
-                    var l0 = i0[pm + bx + 2]
-                    var l1 = i1[pm + bx + 2]
-                    var l2 = i2[pm + bx + 2]
-                    var c0 = i0[pm + bx + 3]
-                    var c1 = i1[pm + bx + 3]
-                    var c2 = i2[pm + bx + 3]
-                    var dl = sh[sho + bx + 2]
-                    for (x in bx until runEnd) {
-                        val ni = nisRow[x]
-                        val li = x + 3
-                        val dr = sh[sho + li]
-                        val r0 = i0[pm + li + 1]
-                        val r1 = i1[pm + li + 1]
-                        val r2 = i2[pm + li + 1]
-                        // max(0, v)。NaN はそのまま (maxOf と同じ)、-0 は 0 と違うが足し算の結果は変わらない
-                        val vr = 1f + dr * ni
-                        val vl = 1f + dl * ni
-                        val vd = 1f + sv[svo + li] * ni
-                        val vu = 1f + sv[svu + li] * ni
-                        val wr = if (vr < 0f) 0f else vr
-                        val wl = if (vl < 0f) 0f else vl
-                        val wd = if (vd < 0f) 0f else vd
-                        val wu = if (vu < 0f) 0f else vu
-                        val inv = 1f / (1f + wr + wl + wd + wu)
-                        val oi = o + li
-                        o0[oi] = (c0 + wr * r0 + wl * l0 + wd * i0[pd + li] + wu * i0[pu + li]) * inv
-                        o1[oi] = (c1 + wr * r1 + wl * l1 + wd * i1[pd + li] + wu * i1[pu + li]) * inv
-                        o2[oi] = (c2 + wr * r2 + wl * l2 + wd * i2[pd + li] + wu * i2[pu + li]) * inv
-                        l0 = c0; l1 = c1; l2 = c2
-                        c0 = r0; c1 = r1; c2 = r2
-                        dl = dr
-                    }
+                for (x in bx until runEnd) {
+                    val ni = nisRow[x]
+                    val li = x + 3
+                    // max(0, v)。NaN はそのまま (maxOf と同じ)、-0 は 0 と違うが足し算の結果は変わらない
+                    val vr = 1f + sh[sho + li] * ni
+                    val vl = 1f + sh[sho + li - 1] * ni
+                    val vd = 1f + sv[svo + li] * ni
+                    val vu = 1f + sv[svu + li] * ni
+                    val wr = if (vr < 0f) 0f else vr
+                    val wl = if (vl < 0f) 0f else vl
+                    val wd = if (vd < 0f) 0f else vd
+                    val wu = if (vu < 0f) 0f else vu
+                    val inv = 1f / (1f + wr + wl + wd + wu)
+                    val pml = pm + li
+                    val oi = o + li
+                    o0[oi] = (i0[pml] + wr * i0[pml + 1] + wl * i0[pml - 1] + wd * i0[pd + li] + wu * i0[pu + li]) * inv
+                    o1[oi] = (i1[pml] + wr * i1[pml + 1] + wl * i1[pml - 1] + wd * i1[pd + li] + wu * i1[pu + li]) * inv
+                    o2[oi] = (i2[pml] + wr * i2[pml + 1] + wl * i2[pml - 1] + wd * i2[pd + li] + wu * i2[pu + li]) * inv
                 }
                 // 平滑化しないブロック (sigma が小さい) はそのまま写す
                 bx = runEnd
@@ -486,32 +486,129 @@ internal object Filters {
             }
         }
 
-        /** 12 近傍のカーネルの段階 0 (iters = 3 のときだけ使う) */
+        /** 段階 0 の 6 方向の重み付き差分 (行 r から r+1・r+2 へ) */
+        private fun rawDiff0(k: Int, r: Int) {
+            val st = stages[k]
+            val pv = stages[k - 1]
+            val a = ensure(k - 1, r)
+            val b = ensure(k - 1, r + 1)
+            val c = ensure(k - 1, r + 2)
+            val p = params!!
+            val s0 = p.channelScale[0]
+            val s1 = p.channelScale[1]
+            val s2 = p.channelScale[2]
+            val p0 = pv.rows[0]
+            val p1 = pv.rows[1]
+            val p2 = pv.rows[2]
+            val hd = st.hd
+            val vd = st.vd
+            val h2d = st.h2d
+            val v2d = st.v2d
+            val drd = st.drd
+            val dld = st.dld
+            val lb = (r and 3) * pw
+            // 行 r の差分は出力行 r-1 .. r+3 で使われる
+            forActiveRuns(r - 1, r + 3) { xs, xe ->
+                val x0 = maxOf(0, xs)
+                val x1 = minOf(pw, xe + 5)
+                val x1m1 = minOf(pw - 1, x1)
+                val x1m2 = minOf(pw - 2, x1)
+                for (x in x0 until x1m1) {
+                    val ax = a + x
+                    hd[lb + x] = s0 * kotlin.math.abs(p0[ax + 1] - p0[ax]) +
+                        s1 * kotlin.math.abs(p1[ax + 1] - p1[ax]) +
+                        s2 * kotlin.math.abs(p2[ax + 1] - p2[ax])
+                }
+                for (x in x0 until x1m2) {
+                    val ax = a + x
+                    h2d[lb + x] = s0 * kotlin.math.abs(p0[ax + 2] - p0[ax]) +
+                        s1 * kotlin.math.abs(p1[ax + 2] - p1[ax]) +
+                        s2 * kotlin.math.abs(p2[ax + 2] - p2[ax])
+                }
+                for (x in x0 until x1) {
+                    val ax = a + x
+                    val bx = b + x
+                    val cx = c + x
+                    val a0 = p0[ax]; val a1 = p1[ax]; val a2 = p2[ax]
+                    vd[lb + x] = s0 * kotlin.math.abs(p0[bx] - a0) +
+                        s1 * kotlin.math.abs(p1[bx] - a1) +
+                        s2 * kotlin.math.abs(p2[bx] - a2)
+                    v2d[lb + x] = s0 * kotlin.math.abs(p0[cx] - a0) +
+                        s1 * kotlin.math.abs(p1[cx] - a1) +
+                        s2 * kotlin.math.abs(p2[cx] - a2)
+                }
+                for (x in x0 until x1m1) {
+                    val ax = a + x
+                    val bx1 = b + x + 1
+                    drd[lb + x] = s0 * kotlin.math.abs(p0[bx1] - p0[ax]) +
+                        s1 * kotlin.math.abs(p1[bx1] - p1[ax]) +
+                        s2 * kotlin.math.abs(p2[bx1] - p2[ax])
+                }
+                for (x in maxOf(1, x0) until x1) {
+                    val ax = a + x
+                    val bxm1 = b + x - 1
+                    dld[lb + x] = s0 * kotlin.math.abs(p0[bxm1] - p0[ax]) +
+                        s1 * kotlin.math.abs(p1[bxm1] - p1[ax]) +
+                        s2 * kotlin.math.abs(p2[bxm1] - p2[ax])
+                }
+            }
+        }
+
+        /** 12 近傍のカーネルの段階 0 (iters = 3 のときだけ使う)。対称な 6 方向の差分と 5 点十字和を共有して計算する */
         private fun step0(k: Int, y: Int, o: Int) {
             val st = stages[k]
             val pv = stages[k - 1]
             val p = params!!
-            // 前の段階の行 y-3 .. y+3 の位置から、カーネルの各点と距離の各点の位置を求める
-            val rowOff = IntArray(7) { ensure(k - 1, y - 3 + it) }
-            val nk = KERNEL0.size / 2
-            val nd = DIST0.size / 2
-            for (t in 0 until nk) {
-                val kx = KERNEL0[2 * t]
-                val ky = KERNEL0[2 * t + 1]
-                tapK[t] = rowOff[ky + 3] + kx
-                for (d in 0 until nd) {
-                    val dx = DIST0[2 * d]
-                    val dy = DIST0[2 * d + 1]
-                    tapA[t * nd + d] = rowOff[ky + dy + 3] + kx + dx
-                    tapB[t * nd + d] = rowOff[dy + 3] + dx
+            // 縦・斜め 4 方向の 5 点十字和 (4 行の環状バッファ)。行 r の十字和には r-1..r+1 が要るので、
+            // 4 行環状バッファの古い行 (y-3) を r=y-2 で読み終えてから次の行 (y+1) を書く
+            while (st.vcNext <= y) {
+                val r = st.vcNext
+                while (st.rawNext <= r + 1) {
+                    rawDiff0(k, st.rawNext)
+                    st.rawNext++
+                }
+                val vr = (r and 3) * pw
+                val vu = ((r - 1) and 3) * pw
+                val vn = ((r + 1) and 3) * pw
+                val vd = st.vd; val vc = st.vc
+                val v2d = st.v2d; val v2c = st.v2c
+                val drd = st.drd; val drc = st.drc
+                val dld = st.dld; val dlc = st.dlc
+                forActiveRuns(r, r + 2) { xs, xe ->
+                    val x0 = maxOf(1, xs + 1)
+                    val x1 = minOf(pw - 1, xe + 4)
+                    for (x in x0 until x1) {
+                        vc[vr + x] = vd[vr + x] + vd[vu + x] + vd[vn + x] + vd[vr + x - 1] + vd[vr + x + 1]
+                        v2c[vr + x] = v2d[vr + x] + v2d[vu + x] + v2d[vn + x] + v2d[vr + x - 1] + v2d[vr + x + 1]
+                        drc[vr + x] = drd[vr + x] + drd[vu + x] + drd[vn + x] + drd[vr + x - 1] + drd[vr + x + 1]
+                        dlc[vr + x] = dld[vr + x] + dld[vu + x] + dld[vn + x] + dld[vr + x - 1] + dld[vr + x + 1]
+                    }
+                }
+                st.vcNext++
+            }
+            // 水平 2 方向の 5 点十字和 (今の行 y だけ)
+            val r0 = (y and 3) * pw
+            val r1u = ((y - 1) and 3) * pw
+            val r2u = ((y - 2) and 3) * pw
+            val r1d = ((y + 1) and 3) * pw
+            val hd = st.hd; val hc = st.hc
+            val h2d = st.h2d; val h2c = st.h2c
+            forActiveRuns(y, y) { xs, xe ->
+                val x0 = maxOf(1, xs + 1)
+                val x1 = minOf(pw - 1, xe + 3)
+                for (x in x0 until x1) {
+                    hc[x] = hd[r0 + x] + hd[r1u + x] + hd[r1d + x] + hd[r0 + x - 1] + hd[r0 + x + 1]
+                    h2c[x] = h2d[r0 + x] + h2d[r1u + x] + h2d[r1d + x] + h2d[r0 + x - 1] + h2d[r0 + x + 1]
                 }
             }
-            val pm = rowOff[3]
+            val pm = ensure(k - 1, y)
+            val pu1 = ensure(k - 1, y - 1)
+            val pu2 = ensure(k - 1, y - 2)
+            val pd1 = ensure(k - 1, y + 1)
+            val pd2 = ensure(k - 1, y + 2)
+            val vc = st.vc; val v2c = st.v2c; val drc = st.drc; val dlc = st.dlc
             val stepMul = p.pass0SigmaScale
             val border = p.borderSadMul
-            val scale0 = p.channelScale[0]
-            val scale1 = p.channelScale[1]
-            val scale2 = p.channelScale[2]
             val i0 = pv.rows[0]
             val i1 = pv.rows[1]
             val i2 = pv.rows[2]
@@ -519,49 +616,68 @@ internal object Filters {
             val o1 = st.rows[1]
             val o2 = st.rows[2]
             val sig = sigma
+            val sRow = (y shr 3) * sigmaStride + xb0
             val yBorder = ((y + 1) and 6) == 0
-            for (x in 0 until w) {
-                val s = if (sig != null) sig[(y shr 3) * sigmaStride + xb0 + (x shr 3)] else p.sigmaForModular
-                val li = x + 3
-                val pi = pm + li
-                val oi = o + li
-                if (s < 0.3f) {
-                    o0[oi] = i0[pi]
-                    o1[oi] = i1[pi]
-                    o2[oi] = i2[pi]
-                    continue
+            val nisRow = nis
+            var bx = 0
+            while (bx < w) {
+                var runEnd = bx
+                while (runEnd < w) {
+                    val s = if (sig != null) sig[sRow + (runEnd shr 3)] else p.sigmaForModular
+                    if (s < 0.3f) break
+                    val xEnd = minOf(w, runEnd + 8)
+                    val nisBorder = EPF_C0 / s * stepMul * border
+                    val nisInner = if (yBorder) nisBorder else EPF_C0 / s * stepMul
+                    nisRow[runEnd] = nisBorder
+                    for (x in runEnd + 1 until xEnd) nisRow[x] = nisInner
+                    if (xEnd - runEnd == 8) nisRow[runEnd + 7] = nisBorder
+                    runEnd = xEnd
                 }
-                val xb = x and 7
-                val sm = if (yBorder || xb == 0 || xb == 7) stepMul * border else stepMul
-                val negInvSigma = EPF_C0 / s * sm
-                var sumW = 1f
-                var s0 = i0[pi]
-                var s1 = i1[pi]
-                var s2 = i2[pi]
-                for (t in 0 until nk) {
-                    val ki = tapK[t] + li
-                    var a0 = 0f
-                    var a1 = 0f
-                    var a2 = 0f
-                    for (d in 0 until nd) {
-                        val ia = tapA[t * nd + d] + li
-                        val ib = tapB[t * nd + d] + li
-                        a0 += kotlin.math.abs(i0[ia] - i0[ib])
-                        a1 += kotlin.math.abs(i1[ia] - i1[ib])
-                        a2 += kotlin.math.abs(i2[ia] - i2[ib])
-                    }
-                    val dd = scale0 * a0 + scale1 * a1 + scale2 * a2
-                    var wt = 1f + dd * negInvSigma
-                    if (wt < 0f) wt = 0f
-                    sumW += wt
-                    s0 += wt * i0[ki]
-                    s1 += wt * i1[ki]
-                    s2 += wt * i2[ki]
+                for (x in bx until runEnd) {
+                    val ni = nisRow[x]
+                    val li = x + 3
+                    // 12 近傍の重み (max(0, 1 + d * ni))
+                    val t0 = 1f + v2c[r2u + li] * ni; val w0 = if (t0 < 0f) 0f else t0
+                    val t1 = 1f + drc[r1u + li - 1] * ni; val w1 = if (t1 < 0f) 0f else t1
+                    val t2 = 1f + vc[r1u + li] * ni; val w2 = if (t2 < 0f) 0f else t2
+                    val t3 = 1f + dlc[r1u + li + 1] * ni; val w3 = if (t3 < 0f) 0f else t3
+                    val t4 = 1f + h2c[li - 2] * ni; val w4 = if (t4 < 0f) 0f else t4
+                    val t5 = 1f + hc[li - 1] * ni; val w5 = if (t5 < 0f) 0f else t5
+                    val t6 = 1f + hc[li] * ni; val w6 = if (t6 < 0f) 0f else t6
+                    val t7 = 1f + h2c[li] * ni; val w7 = if (t7 < 0f) 0f else t7
+                    val t8 = 1f + dlc[r0 + li] * ni; val w8 = if (t8 < 0f) 0f else t8
+                    val t9 = 1f + vc[r0 + li] * ni; val w9 = if (t9 < 0f) 0f else t9
+                    val t10 = 1f + drc[r0 + li] * ni; val w10 = if (t10 < 0f) 0f else t10
+                    val t11 = 1f + v2c[r0 + li] * ni; val w11 = if (t11 < 0f) 0f else t11
+                    val inv = 1f / (1f + w0 + w1 + w2 + w3 + w4 + w5 + w6 + w7 + w8 + w9 + w10 + w11)
+                    val oi = o + li
+                    val pml = pm + li; val pu1l = pu1 + li; val pu2l = pu2 + li; val pd1l = pd1 + li; val pd2l = pd2 + li
+                    o0[oi] = (
+                        i0[pml] + w0 * i0[pu2l] + w1 * i0[pu1l - 1] + w2 * i0[pu1l] + w3 * i0[pu1l + 1] +
+                            w4 * i0[pml - 2] + w5 * i0[pml - 1] + w6 * i0[pml + 1] + w7 * i0[pml + 2] +
+                            w8 * i0[pd1l - 1] + w9 * i0[pd1l] + w10 * i0[pd1l + 1] + w11 * i0[pd2l]
+                        ) * inv
+                    o1[oi] = (
+                        i1[pml] + w0 * i1[pu2l] + w1 * i1[pu1l - 1] + w2 * i1[pu1l] + w3 * i1[pu1l + 1] +
+                            w4 * i1[pml - 2] + w5 * i1[pml - 1] + w6 * i1[pml + 1] + w7 * i1[pml + 2] +
+                            w8 * i1[pd1l - 1] + w9 * i1[pd1l] + w10 * i1[pd1l + 1] + w11 * i1[pd2l]
+                        ) * inv
+                    o2[oi] = (
+                        i2[pml] + w0 * i2[pu2l] + w1 * i2[pu1l - 1] + w2 * i2[pu1l] + w3 * i2[pu1l + 1] +
+                            w4 * i2[pml - 2] + w5 * i2[pml - 1] + w6 * i2[pml + 1] + w7 * i2[pml + 2] +
+                            w8 * i2[pd1l - 1] + w9 * i2[pd1l] + w10 * i2[pd1l + 1] + w11 * i2[pd2l]
+                        ) * inv
                 }
-                val inv = 1f / sumW
-                o0[oi] = s0 * inv
-                o1[oi] = s1 * inv
-                o2[oi] = s2 * inv
+                bx = runEnd
+                while (bx < w) {
+                    val s = if (sig != null) sig[sRow + (bx shr 3)] else p.sigmaForModular
+                    if (!(s < 0.3f)) break
+                    val xEnd = minOf(w, bx + 8)
+                    System.arraycopy(i0, pm + bx + 3, o0, o + bx + 3, xEnd - bx)
+                    System.arraycopy(i1, pm + bx + 3, o1, o + bx + 3, xEnd - bx)
+                    System.arraycopy(i2, pm + bx + 3, o2, o + bx + 3, xEnd - bx)
+                    bx = xEnd
+                }
             }
         }
 

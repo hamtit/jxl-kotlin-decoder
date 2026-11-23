@@ -277,6 +277,12 @@ internal object Dct {
      * 0 でない係数があるのは上から [rows] 行だけ (残りの行は変換しても 0 なので飛ばす)。t は 128 要素以上
      */
     fun idct8x8(buf: FloatArray, base: Int, stride: Int, rows: Int, t: FloatArray) {
+        if (rows == 1) {
+            for (x in 0 until 8) t[x] = buf[base + x]
+            idct8(t, 0)
+            for (y in 0 until 8) System.arraycopy(t, 0, buf, base + y * stride, 8)
+            return
+        }
         for (y in 0 until rows) {
             val o = base + y * stride
             val r = y * 8
@@ -302,7 +308,7 @@ internal object Dct {
 
     /**
      * 幅 w・高さ h (8 以上) の逆 DCT。0 でない係数があるのは上から [rows] 行だけで、
-     * 残りの行は行方向の変換をしても 0 なので飛ばす。scratch は 2 * max(w, h) 以上
+     * 残りの行は既に 0 で埋められている前提 (行方向の変換を飛ばす)。scratch は 2 * max(w, h) 以上
      */
     fun idct2d(buf: FloatArray, base: Int, stride: Int, w: Int, h: Int, rows: Int, scratch: FloatArray, cs: ColScratch) {
         if (w == 8 && h == 8) {
@@ -312,12 +318,16 @@ internal object Dct {
         for (y in 0 until rows) dctInPlace(buf, base + y * stride, w, scratch, 0, false)
         // 列方向は、幅 16 以上で高さ 32 以下なら列をまとめて (行どうしの演算で) 変換する
         if (w >= 16 && h <= 32) {
-            if (h > 8) cs.ensure(w)
-            for (y in rows until h) buf.fill(0f, base + y * stride, base + y * stride + w)
             when (h) {
                 8 -> idct8Cols(buf, base, stride, buf, base, stride, w)
-                16 -> idct16Cols(buf, base, stride, buf, base, stride, w, cs.a, cs.b)
-                else -> idct32Cols(buf, base, stride, w, cs)
+                16 -> {
+                    cs.ensure16(w)
+                    idct16Cols(buf, base, stride, buf, base, stride, w, cs.a, cs.b)
+                }
+                else -> {
+                    cs.ensure32(w)
+                    idct32Cols(buf, base, stride, w, cs)
+                }
             }
             return
         }
@@ -330,21 +340,25 @@ internal object Dct {
         }
     }
 
-    /** 列方向の変換の作業領域 (幅 w の行を 32 行ずつ) */
+    /** 列方向の変換の作業領域 */
     class ColScratch {
-        var w = 0
         var a = FloatArray(0)
         var b = FloatArray(0)
         var c = FloatArray(0)
         var d = FloatArray(0)
 
-        fun ensure(width: Int) {
-            if (width <= w) return
-            w = width
-            a = FloatArray(32 * width)
-            b = FloatArray(32 * width)
-            c = FloatArray(32 * width)
-            d = FloatArray(32 * width)
+        fun ensure16(width: Int) {
+            val n = 16 * width
+            if (a.size < n) a = FloatArray(n)
+            if (b.size < n) b = FloatArray(n)
+        }
+
+        fun ensure32(width: Int) {
+            val n = 32 * width
+            if (a.size < n) a = FloatArray(n)
+            if (b.size < n) b = FloatArray(n)
+            if (c.size < n) c = FloatArray(n)
+            if (d.size < n) d = FloatArray(n)
         }
 
         fun bytes(): Long = 4L * (a.size + b.size + c.size + d.size)

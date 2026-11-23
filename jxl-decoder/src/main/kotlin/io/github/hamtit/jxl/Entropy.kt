@@ -26,214 +26,198 @@ internal fun addLog2Ceil(x: Int): Int {
     return if (v <= 1) 0 else 32 - Integer.numberOfLeadingZeros(v - 1)
 }
 
-/** ANS のヒストグラム (エイリアス表) */
-internal class AnsHistogram(
-    val buckets: LongArray,
-    val logBucketSize: Int,
-    val singleSymbol: Int,
-) {
-    /** state は 32 ビット符号なし値を Long で持つ */
-    fun readSymbol(br: BitReader, reader: EntropyReader): Int {
-        val state = reader.ansState
-        val idx = (state and 0xfff).toInt()
-        val i = idx ushr logBucketSize
-        val pos = idx and ((1 shl logBucketSize) - 1)
-        val b = buckets[i]
-        val cutoff = ((b ushr 8) and 0xff).toInt()
-        var dist = ((b ushr 16) and 0xffff).toInt()
-        val symbol: Int
-        val offset: Int
-        if (pos >= cutoff) {
-            offset = ((b ushr 32) and 0xffff).toInt() + pos
-            dist = dist xor ((b ushr 48) and 0xffff).toInt()
-            symbol = (b and 0xff).toInt()
-        } else {
-            offset = pos
-            symbol = i
+/** ANS のヒストグラム構築の作業領域 (クラスタ間で使い回す) */
+internal class AnsParseScratch(tableSize: Int) {
+    val dist = IntArray(tableSize)
+    val repeatStart = IntArray(tableSize)
+    val repeatEnd = IntArray(tableSize)
+    val aliasSymbol = IntArray(tableSize)
+    val aliasOffset = IntArray(tableSize)
+    val aliasCutoff = IntArray(tableSize)
+    val underfull = IntArray(tableSize)
+    val overfull = IntArray(tableSize)
+}
+
+/** ANS のヒストグラム (エイリアス表) のパーサー */
+internal object AnsHistogram {
+    private fun readU8(br: BitReader): Int =
+        if (br.readBool()) {
+            val n = br.readBits(3)
+            (1 shl n) + br.readBits(n)
+        } else 0
+
+    private fun readPrefix(br: BitReader): Int = when (br.readBits(3)) {
+        0 -> 10
+        1 -> {
+            if (br.readBool()) 4
+            else if (br.readBool()) 0
+            else if (br.readBool()) 11
+            else if (br.readBool()) 13
+            else 12
         }
-        var next = (state ushr 12) * dist + offset
-        if (next < 0x10000) {
-            next = (next shl 16) or br.readBits(16).toLong()
-        }
-        reader.ansState = next
-        return symbol
+        2 -> 7
+        3 -> if (br.readBool()) 1 else 3
+        4 -> 6
+        5 -> 8
+        6 -> 9
+        else -> if (br.readBool()) 2 else 5
     }
 
-    companion object {
-        private fun readU8(br: BitReader): Int =
+    /**
+     * 1 クラスタ分のエイリアス表を [buckets] の [base] から書き込む。
+     * 単一シンボルのヒストグラムならそのシンボル、そうでなければ -1 を返す。
+     */
+    fun parseInto(br: BitReader, logAlphabetSize: Int, buckets: LongArray, base: Int, sc: AnsParseScratch): Int {
+        val tableSize = 1 shl logAlphabetSize
+        val logBucketSize = 12 - logAlphabetSize
+        val bucketSize = 1 shl logBucketSize
+        val dist = sc.dist
+        dist.fill(0, 0, tableSize)
+        val alphabetSize: Int
+        if (br.readBool()) {
             if (br.readBool()) {
-                val n = br.readBits(3)
-                (1 shl n) + br.readBits(n)
-            } else 0
-
-        private fun readPrefix(br: BitReader): Int = when (br.readBits(3)) {
-            0 -> 10
-            1 -> {
-                if (br.readBool()) 4
-                else if (br.readBool()) 0
-                else if (br.readBool()) 11
-                else if (br.readBool()) 13
-                else 12
-            }
-            2 -> 7
-            3 -> if (br.readBool()) 1 else 3
-            4 -> 6
-            5 -> 8
-            6 -> 9
-            else -> if (br.readBool()) 2 else 5
-        }
-
-        fun parse(br: BitReader, logAlphabetSize: Int): AnsHistogram {
-            val tableSize = 1 shl logAlphabetSize
-            val logBucketSize = 12 - logAlphabetSize
-            val bucketSize = 1 shl logBucketSize
-            val dist = IntArray(tableSize)
-            val alphabetSize: Int
-            if (br.readBool()) {
-                if (br.readBool()) {
-                    val v0 = readU8(br)
-                    val v1 = readU8(br)
-                    if (v0 == v1) fail("invalid ANS histogram")
-                    alphabetSize = maxOf(v0, v1) + 1
-                    if (alphabetSize > tableSize) fail("invalid ANS histogram")
-                    val prob = br.readBits(12)
-                    dist[v0] = prob
-                    dist[v1] = 4096 - prob
-                } else {
-                    val v = readU8(br)
-                    alphabetSize = v + 1
-                    if (alphabetSize > tableSize) fail("invalid ANS histogram")
-                    dist[v] = 4096
-                }
-            } else if (br.readBool()) {
-                alphabetSize = readU8(br) + 1
+                val v0 = readU8(br)
+                val v1 = readU8(br)
+                if (v0 == v1) fail("invalid ANS histogram")
+                alphabetSize = maxOf(v0, v1) + 1
                 if (alphabetSize > tableSize) fail("invalid ANS histogram")
-                val base = 4096 / alphabetSize
-                val leftover = 4096 % alphabetSize
-                for (i in 0 until alphabetSize) dist[i] = if (i < leftover) base + 1 else base
+                val prob = br.readBits(12)
+                dist[v0] = prob
+                dist[v1] = 4096 - prob
             } else {
-                var len = 0
-                while (len < 3) {
-                    if (br.readBool()) len++ else break
-                }
-                val shift = br.readBits(len) + (1 shl len) - 1
-                if (shift > 13) fail("invalid ANS histogram")
-                alphabetSize = readU8(br) + 3
+                val v = readU8(br)
+                alphabetSize = v + 1
                 if (alphabetSize > tableSize) fail("invalid ANS histogram")
-                // 13 は直前の値の繰り返し
-                val repeatStart = IntArray(alphabetSize)
-                val repeatEnd = IntArray(alphabetSize)
-                var numRepeat = 0
-                var omitLog = -1
-                var omitPos = -1
-                var idx = 0
-                while (idx < alphabetSize) {
-                    dist[idx] = readPrefix(br)
-                    if (dist[idx] == 13) {
-                        val repeatCount = readU8(br) + 4
-                        if (idx + repeatCount > alphabetSize) fail("invalid ANS histogram")
-                        repeatStart[numRepeat] = idx
-                        repeatEnd[numRepeat] = idx + repeatCount
-                        numRepeat++
-                        idx += repeatCount
+                dist[v] = 4096
+            }
+        } else if (br.readBool()) {
+            alphabetSize = readU8(br) + 1
+            if (alphabetSize > tableSize) fail("invalid ANS histogram")
+            val baseVal = 4096 / alphabetSize
+            val leftover = 4096 % alphabetSize
+            for (i in 0 until alphabetSize) dist[i] = if (i < leftover) baseVal + 1 else baseVal
+        } else {
+            var len = 0
+            while (len < 3) {
+                if (br.readBool()) len++ else break
+            }
+            val shift = br.readBits(len) + (1 shl len) - 1
+            if (shift > 13) fail("invalid ANS histogram")
+            alphabetSize = readU8(br) + 3
+            if (alphabetSize > tableSize) fail("invalid ANS histogram")
+            // 13 は直前の値の繰り返し
+            val repeatStart = sc.repeatStart
+            val repeatEnd = sc.repeatEnd
+            var numRepeat = 0
+            var omitLog = -1
+            var omitPos = -1
+            var idx = 0
+            while (idx < alphabetSize) {
+                dist[idx] = readPrefix(br)
+                if (dist[idx] == 13) {
+                    val repeatCount = readU8(br) + 4
+                    if (idx + repeatCount > alphabetSize) fail("invalid ANS histogram")
+                    repeatStart[numRepeat] = idx
+                    repeatEnd[numRepeat] = idx + repeatCount
+                    numRepeat++
+                    idx += repeatCount
+                    continue
+                }
+                if (omitPos < 0 || dist[idx] > omitLog) {
+                    omitLog = dist[idx]
+                    omitPos = idx
+                }
+                idx++
+            }
+            if (omitPos < 0) fail("invalid ANS histogram")
+            if (omitPos + 1 < tableSize && dist[omitPos + 1] == 13) fail("invalid ANS histogram")
+            var rIdx = 0
+            var acc = 0
+            var prev = 0
+            for (i in 0 until tableSize) {
+                if (rIdx < numRepeat && repeatStart[rIdx] <= i) {
+                    if (repeatEnd[rIdx] == i) {
+                        rIdx++
+                    } else {
+                        dist[i] = prev
+                        acc += prev
+                        if (acc > 4096) fail("invalid ANS histogram")
                         continue
                     }
-                    if (omitPos < 0 || dist[idx] > omitLog) {
-                        omitLog = dist[idx]
-                        omitPos = idx
-                    }
-                    idx++
                 }
-                if (omitPos < 0) fail("invalid ANS histogram")
-                if (omitPos + 1 < tableSize && dist[omitPos + 1] == 13) fail("invalid ANS histogram")
-                var rIdx = 0
-                var acc = 0
-                var prev = 0
-                for (i in 0 until tableSize) {
-                    if (rIdx < numRepeat && repeatStart[rIdx] <= i) {
-                        if (repeatEnd[rIdx] == i) {
-                            rIdx++
-                        } else {
-                            dist[i] = prev
-                            acc += prev
-                            if (acc > 4096) fail("invalid ANS histogram")
-                            continue
-                        }
-                    }
-                    val code = dist[i]
-                    if (code == 0 || i == omitPos) {
-                        prev = 0
-                        continue
-                    }
-                    var value = code
-                    if (code > 1) {
-                        val zeros = code - 1
-                        val bitcount = (shift - ((12 - zeros) shr 1)).coerceIn(0, zeros)
-                        value = (1 shl zeros) + (br.readBits(bitcount) shl (zeros - bitcount))
-                    }
-                    dist[i] = value
-                    prev = value
-                    acc += value
-                    if (acc > 4096) fail("invalid ANS histogram")
+                val code = dist[i]
+                if (code == 0 || i == omitPos) {
+                    prev = 0
+                    continue
                 }
-                dist[omitPos] = 4096 - acc
-                if (dist[omitPos] < 0) fail("invalid ANS histogram")
-            }
-
-            var single = -1
-            for (i in 0 until tableSize) if (dist[i] == 4096) { single = i; break }
-            val buckets = LongArray(tableSize)
-            if (single >= 0) {
-                for (i in 0 until tableSize) {
-                    val d = dist[i]
-                    buckets[i] = pack(single, 0, d, bucketSize * i, d xor 4096)
+                var value = code
+                if (code > 1) {
+                    val zeros = code - 1
+                    val bitcount = (shift - ((12 - zeros) shr 1)).coerceIn(0, zeros)
+                    value = (1 shl zeros) + (br.readBits(bitcount) shl (zeros - bitcount))
                 }
-                return AnsHistogram(buckets, logBucketSize, single)
+                dist[i] = value
+                prev = value
+                acc += value
+                if (acc > 4096) fail("invalid ANS histogram")
             }
-
-            val aliasSymbol = IntArray(tableSize)
-            val aliasOffset = IntArray(tableSize)
-            val aliasCutoff = IntArray(tableSize)
-            for (i in 0 until tableSize) {
-                aliasSymbol[i] = if (i < alphabetSize) i else 0
-                aliasCutoff[i] = dist[i]
-            }
-            val underfull = IntArray(tableSize)
-            var nu = 0
-            val overfull = IntArray(tableSize)
-            var no = 0
-            for (i in 0 until tableSize) {
-                if (dist[i] < bucketSize) underfull[nu++] = i
-                else if (dist[i] > bucketSize) overfull[no++] = i
-            }
-            while (no > 0 && nu > 0) {
-                val o = overfull[--no]
-                val u = underfull[--nu]
-                val by = bucketSize - aliasCutoff[u]
-                aliasCutoff[o] -= by
-                aliasSymbol[u] = o
-                aliasOffset[u] = aliasCutoff[o]
-                if (aliasCutoff[o] < bucketSize) underfull[nu++] = o
-                else if (aliasCutoff[o] > bucketSize) overfull[no++] = o
-            }
-            for (i in 0 until tableSize) {
-                buckets[i] = if (aliasCutoff[i] == bucketSize) {
-                    pack(i, 0, dist[i], 0, 0)
-                } else {
-                    pack(
-                        aliasSymbol[i], aliasCutoff[i], dist[i],
-                        aliasOffset[i] - aliasCutoff[i], dist[i] xor dist[aliasSymbol[i]],
-                    )
-                }
-            }
-            return AnsHistogram(buckets, logBucketSize, -1)
+            dist[omitPos] = 4096 - acc
+            if (dist[omitPos] < 0) fail("invalid ANS histogram")
         }
 
-        private fun pack(sym: Int, cutoff: Int, dist: Int, offset: Int, xor: Int): Long =
-            (sym.toLong() and 0xff) or ((cutoff.toLong() and 0xff) shl 8) or
-                ((dist.toLong() and 0xffff) shl 16) or ((offset.toLong() and 0xffff) shl 32) or
-                ((xor.toLong() and 0xffff) shl 48)
+        var single = -1
+        for (i in 0 until tableSize) if (dist[i] == 4096) { single = i; break }
+        if (single >= 0) {
+            for (i in 0 until tableSize) {
+                val d = dist[i]
+                buckets[base + i] = pack(single, 0, d, bucketSize * i, d xor 4096)
+            }
+            return single
+        }
+
+        val aliasSymbol = sc.aliasSymbol
+        val aliasOffset = sc.aliasOffset
+        val aliasCutoff = sc.aliasCutoff
+        for (i in 0 until tableSize) {
+            aliasSymbol[i] = if (i < alphabetSize) i else 0
+            aliasOffset[i] = 0
+            aliasCutoff[i] = dist[i]
+        }
+        val underfull = sc.underfull
+        var nu = 0
+        val overfull = sc.overfull
+        var no = 0
+        for (i in 0 until tableSize) {
+            if (dist[i] < bucketSize) underfull[nu++] = i
+            else if (dist[i] > bucketSize) overfull[no++] = i
+        }
+        while (no > 0 && nu > 0) {
+            val o = overfull[--no]
+            val u = underfull[--nu]
+            val by = bucketSize - aliasCutoff[u]
+            aliasCutoff[o] -= by
+            aliasSymbol[u] = o
+            aliasOffset[u] = aliasCutoff[o]
+            if (aliasCutoff[o] < bucketSize) underfull[nu++] = o
+            else if (aliasCutoff[o] > bucketSize) overfull[no++] = o
+        }
+        for (i in 0 until tableSize) {
+            buckets[base + i] = if (aliasCutoff[i] == bucketSize) {
+                pack(i, 0, dist[i], 0, 0)
+            } else {
+                pack(
+                    aliasSymbol[i], aliasCutoff[i], dist[i],
+                    aliasOffset[i] - aliasCutoff[i], dist[i] xor dist[aliasSymbol[i]],
+                )
+            }
+        }
+        return -1
     }
+
+    private fun pack(sym: Int, cutoff: Int, dist: Int, offset: Int, xor: Int): Long =
+        (sym.toLong() and 0xff) or ((cutoff.toLong() and 0xff) shl 8) or
+            ((dist.toLong() and 0xffff) shl 16) or ((offset.toLong() and 0xffff) shl 32) or
+            ((xor.toLong() and 0xffff) shl 48)
 }
 
 /** プレフィックス符号 (Brotli 形式) のヒストグラム */
@@ -478,68 +462,74 @@ internal class PrefixHistogram private constructor(
  * 読み出し状態は [EntropyReader] が持つので、同じ符号を複数スレッドから使える。
  */
 internal class EntropyCode private constructor(
-    val clusters: IntArray,
+    val clusters: ByteArray,
     val configs: Array<IntegerConfig>,
-    private val ans: Array<AnsHistogram>?,
+    private val ansBuckets: LongArray?,
+    private val ansLogAlphabet: Int,
+    private val ansSingles: ShortArray?,
     private val prefix: Array<PrefixHistogram>?,
     val lz77Enabled: Boolean,
     val lz77MinSymbol: Int,
     val lz77MinLength: Int,
     val lz77LenConfig: IntegerConfig?,
 ) {
-    val usesAns: Boolean get() = ans != null
+    val usesAns: Boolean get() = ansBuckets != null
 
     /**
      * ANS で LZ77 なしのときの、全クラスタのエイリアス表を並べた表 (クラスタ c の表は c shl [fastLogAlphabet] から)。
-     * [EntropyReader.readAnsFast] で、クラスタごとのオブジェクトを辿らずに読むのに使う。それ以外は null
+     * [EntropyReader.readAnsFast] で読むのに使う。それ以外は null
      */
-    val fastBuckets: LongArray?
-    val fastLogAlphabet: Int
+    val fastBuckets: LongArray? = if (ansBuckets != null && !lz77Enabled) ansBuckets else null
+    val fastLogAlphabet: Int = if (fastBuckets != null) ansLogAlphabet else 0
     /** クラスタ c の hybrid-uint の設定 (split・splitExponent・msbInToken・lsbInToken) を c * 4 から並べた表 */
-    val fastConfigs: IntArray
-
-    init {
-        val a = ans
-        if (a != null && !lz77Enabled && a.isNotEmpty()) {
-            val lb = a[0].logBucketSize
-            val logAlpha = 12 - lb
-            fastLogAlphabet = logAlpha
-            fastBuckets = LongArray(a.size shl logAlpha).also { fb ->
-                for ((i, h) in a.withIndex()) {
-                    if (h.logBucketSize != lb || h.buckets.size != (1 shl logAlpha)) error("ANS table size mismatch")
-                    System.arraycopy(h.buckets, 0, fb, i shl logAlpha, 1 shl logAlpha)
-                }
-            }
-        } else {
-            fastLogAlphabet = 0
-            fastBuckets = null
-        }
-        fastConfigs = IntArray(configs.size * 4)
+    val fastConfigs: IntArray = IntArray(configs.size * 4).also { fc ->
         for ((i, c) in configs.withIndex()) {
-            fastConfigs[4 * i] = c.split
-            fastConfigs[4 * i + 1] = c.splitExponent
-            fastConfigs[4 * i + 2] = c.msbInToken
-            fastConfigs[4 * i + 3] = c.lsbInToken
+            fc[4 * i] = c.split
+            fc[4 * i + 1] = c.splitExponent
+            fc[4 * i + 2] = c.msbInToken
+            fc[4 * i + 3] = c.lsbInToken
         }
     }
 
     fun newReader(): EntropyReader = EntropyReader(this)
 
     fun readSymbol(br: BitReader, cluster: Int, reader: EntropyReader): Int {
-        val a = ans
-        return if (a != null) {
+        val ab = ansBuckets
+        if (ab != null) {
             if (reader.ansInitial) {
                 reader.ansState = br.readBits(32).toLong() and 0xffffffffL
                 reader.ansInitial = false
             }
-            a[cluster].readSymbol(br, reader)
-        } else {
-            prefix!![cluster].readSymbol(br)
+            val state = reader.ansState
+            val idx = (state and 0xfff).toInt()
+            val logBucket = 12 - ansLogAlphabet
+            val i = idx ushr logBucket
+            val pos = idx and ((1 shl logBucket) - 1)
+            val b = ab[(cluster shl ansLogAlphabet) + i]
+            val cutoff = ((b ushr 8) and 0xff).toInt()
+            var dist = ((b ushr 16) and 0xffff).toInt()
+            val symbol: Int
+            val offset: Int
+            if (pos >= cutoff) {
+                offset = ((b ushr 32) and 0xffff).toInt() + pos
+                dist = dist xor ((b ushr 48) and 0xffff).toInt()
+                symbol = (b and 0xff).toInt()
+            } else {
+                offset = pos
+                symbol = i
+            }
+            var next = (state ushr 12) * dist + offset
+            if (next < 0x10000) {
+                next = (next shl 16) or br.readBits16().toLong()
+            }
+            reader.ansState = next
+            return symbol
         }
+        return prefix!![cluster].readSymbol(br)
     }
 
     fun singleSymbol(cluster: Int): Int =
-        ans?.get(cluster)?.singleSymbol ?: prefix!![cluster].singleSymbol
+        ansSingles?.get(cluster)?.toInt() ?: prefix!![cluster].singleSymbol
 
     /** LZ77 なしで、常に同じ値を返すクラスタならその値 */
     fun singleToken(cluster: Int): Int {
@@ -549,7 +539,7 @@ internal class EntropyCode private constructor(
         return if (s < configs[cluster].split) s else -1
     }
 
-    val lzDistCluster: Int get() = clusters[clusters.size - 1]
+    val lzDistCluster: Int get() = clusters[clusters.size - 1].toInt() and 0xff
 
     companion object {
         fun parse(br: BitReader, numDist: Int): EntropyCode = parseInner(br, numDist, true)
@@ -569,11 +559,15 @@ internal class EntropyCode private constructor(
             }
             val clusters = readClusters(br, numDist)
             var numClusters = 0
-            for (c in clusters) if (c + 1 > numClusters) numClusters = c + 1
+            for (c in clusters) {
+                val ci = c.toInt() and 0xff
+                if (ci + 1 > numClusters) numClusters = ci + 1
+            }
             val usePrefix = br.readBool()
             val logAlphabetSize = if (usePrefix) 15 else br.readBits(2) + 5
             val configs = Array(numClusters) { IntegerConfig.parse(br, logAlphabetSize) }
-            var ans: Array<AnsHistogram>? = null
+            var ansBuckets: LongArray? = null
+            var ansSingles: ShortArray? = null
             var prefix: Array<PrefixHistogram>? = null
             if (usePrefix) {
                 val counts = IntArray(numClusters) {
@@ -585,32 +579,39 @@ internal class EntropyCode private constructor(
                 for (c in counts) if (c > (1 shl 15)) fail("invalid prefix histogram")
                 prefix = Array(numClusters) { PrefixHistogram.parse(br, counts[it]) }
             } else {
-                ans = Array(numClusters) { AnsHistogram.parse(br, logAlphabetSize) }
+                val buckets = LongArray(numClusters shl logAlphabetSize)
+                val singles = ShortArray(numClusters)
+                val scratch = AnsParseScratch(1 shl logAlphabetSize)
+                for (c in 0 until numClusters) {
+                    singles[c] = AnsHistogram.parseInto(br, logAlphabetSize, buckets, c shl logAlphabetSize, scratch).toShort()
+                }
+                ansBuckets = buckets
+                ansSingles = singles
             }
-            return EntropyCode(clusters, configs, ans, prefix, lz77, minSymbol, minLength, lenConf)
+            return EntropyCode(clusters, configs, ansBuckets, logAlphabetSize, ansSingles, prefix, lz77, minSymbol, minLength, lenConf)
         }
 
-        fun readClusters(br: BitReader, numDist: Int): IntArray {
-            if (numDist == 1) return IntArray(1)
-            val out: IntArray
+        fun readClusters(br: BitReader, numDist: Int): ByteArray {
+            if (numDist == 1) return ByteArray(1)
+            val out: ByteArray
             if (br.readBool()) {
                 val nbits = br.readBits(2)
-                out = IntArray(numDist) { br.readBits(nbits) }
+                out = ByteArray(numDist) { br.readBits(nbits).toByte() }
             } else {
                 val useMtf = br.readBool()
                 val code = parseInner(br, 1, numDist > 2)
                 val reader = code.newReader()
                 reader.begin(br)
-                out = IntArray(numDist) {
+                out = ByteArray(numDist) {
                     val v = reader.read(br, 0)
-                    if (v > 255) fail("invalid cluster index")
-                    v
+                    if (v !in 0..255) fail("invalid cluster index")
+                    v.toByte()
                 }
                 reader.finish()
                 if (useMtf) {
-                    val mtf = IntArray(256) { it }
+                    val mtf = ByteArray(256) { it.toByte() }
                     for (i in out.indices) {
-                        val idx = out[i]
+                        val idx = out[i].toInt() and 0xff
                         val v = mtf[idx]
                         out[i] = v
                         System.arraycopy(mtf, 0, mtf, 1, idx)
@@ -619,9 +620,12 @@ internal class EntropyCode private constructor(
                 }
             }
             var numClusters = 0
-            for (c in out) if (c + 1 > numClusters) numClusters = c + 1
+            for (c in out) {
+                val ci = c.toInt() and 0xff
+                if (ci + 1 > numClusters) numClusters = ci + 1
+            }
             val seen = BooleanArray(numClusters)
-            for (c in out) seen[c] = true
+            for (c in out) seen[c.toInt() and 0xff] = true
             for (s in seen) if (!s) fail("cluster map has a hole")
             return out
         }
@@ -676,14 +680,14 @@ internal class EntropyReader(val code: EntropyCode) {
         return result.toInt()
     }
 
-    fun read(br: BitReader, ctx: Int): Int = readClustered(br, code.clusters[ctx], 0)
+    fun read(br: BitReader, ctx: Int): Int = readClustered(br, code.clusters[ctx].toInt() and 0xff, 0)
 
     /**
      * [EntropyCode.fastBuckets] がある (ANS で LZ77 なし) ときに、クラスタ [cluster] の値を読む。
      * [readClustered] と同じ結果を、表を 1 つの配列から引いて求める ([begin] で状態を読んでおくこと)
      */
     fun readAnsFast(br: BitReader, buckets: LongArray, logAlpha: Int, cfg: IntArray, cluster: Int): Int {
-        // ANS のシンボル (AnsHistogram.readSymbol と同じ)
+        // ANS のシンボル
         val state = ansState
         val idx = (state and 0xfff).toInt()
         val logBucket = 12 - logAlpha
@@ -703,7 +707,7 @@ internal class EntropyReader(val code: EntropyCode) {
             token = i
         }
         var next = (state ushr 12) * dist + offset
-        if (next < 0x10000) next = (next shl 16) or br.readBits(16).toLong()
+        if (next < 0x10000) next = (next shl 16) or br.readBits16().toLong()
         ansState = next
         // hybrid-uint (readUint と同じ)
         val c4 = cluster * 4
