@@ -711,7 +711,7 @@ internal class FrameDecoder(
         val lfBuf = FloatArray(32 * 32)
         val dct = Dct.Scratch()
 
-        fun recycle() = ScratchPool.give(this, coeffs[0].size * (if (intCoeffs != null) 24L else 12L) + 8192L)
+        fun recycle() = ScratchPool.give(this, coeffs[0].size * (if (intCoeffs != null) 24L else 12L) + 8192L + dct.cols.bytes())
 
         companion object {
             fun obtain(size: Int, multiPass: Boolean): GroupScratch =
@@ -966,7 +966,7 @@ internal class FrameDecoder(
                     // HF 係数がすべて 0 の 8x8 は LF の値で埋まる
                     Tt.DCT8 -> if (nz == 0) Dct.fill8x8(buf, base, cw) else Dct.idct8x8(buf, base, cw, nz, scratch)
                     // 0 でない係数があるのは上から max(LF の行数, nz) 行だけ
-                    else -> Dct.idct2d(buf, base, cw, bwb * 8, bhb * 8, maxOf(bhb, nz), scratch)
+                    else -> Dct.idct2d(buf, base, cw, bwb * 8, bhb * 8, maxOf(bhb, nz), scratch, gs.dct.cols)
                 }
             }
             // 色平面へ

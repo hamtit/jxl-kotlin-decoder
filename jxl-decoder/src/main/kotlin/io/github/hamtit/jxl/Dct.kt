@@ -304,18 +304,172 @@ internal object Dct {
      * 幅 w・高さ h (8 以上) の逆 DCT。0 でない係数があるのは上から [rows] 行だけで、
      * 残りの行は行方向の変換をしても 0 なので飛ばす。scratch は 2 * max(w, h) 以上
      */
-    fun idct2d(buf: FloatArray, base: Int, stride: Int, w: Int, h: Int, rows: Int, scratch: FloatArray) {
+    fun idct2d(buf: FloatArray, base: Int, stride: Int, w: Int, h: Int, rows: Int, scratch: FloatArray, cs: ColScratch) {
         if (w == 8 && h == 8) {
             idct8x8(buf, base, stride, rows, scratch)
             return
         }
         for (y in 0 until rows) dctInPlace(buf, base + y * stride, w, scratch, 0, false)
+        // 列方向は、幅 16 以上で高さ 32 以下なら列をまとめて (行どうしの演算で) 変換する
+        if (w >= 16 && h <= 32) {
+            cs.ensure(w)
+            for (y in rows until h) buf.fill(0f, base + y * stride, base + y * stride + w)
+            when (h) {
+                8 -> idct8Cols(buf, base, stride, buf, base, stride, w)
+                16 -> idct16Cols(buf, base, stride, buf, base, stride, w, cs.a, cs.b)
+                else -> idct32Cols(buf, base, stride, w, cs)
+            }
+            return
+        }
         val col = scratch
         for (x in 0 until w) {
             for (y in 0 until rows) col[y] = buf[base + y * stride + x]
             col.fill(0f, rows, h)
             dctInPlace(col, 0, h, col, h, false)
             for (y in 0 until h) buf[base + y * stride + x] = col[y]
+        }
+    }
+
+    /** 列方向の変換の作業領域 (幅 w の行を 32 行ずつ) */
+    class ColScratch {
+        var w = 0
+        var a = FloatArray(0)
+        var b = FloatArray(0)
+        var c = FloatArray(0)
+        var d = FloatArray(0)
+
+        fun ensure(width: Int) {
+            if (width <= w) return
+            w = width
+            a = FloatArray(32 * width)
+            b = FloatArray(32 * width)
+            c = FloatArray(32 * width)
+            d = FloatArray(32 * width)
+        }
+
+        fun bytes(): Long = 4L * (a.size + b.size + c.size + d.size)
+    }
+
+    /*
+     * 列方向の逆 DCT。行 (幅 w) を 1 つの値とみなして idct8・idct16・idct32 と同じ計算をするので、
+     * 列ごとの結果は 1 列ずつ変換したときと同じになる。どのループも隣の要素を順に読み書きするので
+     * HotSpot の自動ベクトル化が効く。読む配列と書く配列は別にする (同じ配列の行どうしだと重なりを証明できず
+     * ベクトル化されない) が、idct8Cols だけは同じ位置への上書きを許す。
+     * 作業領域の行の長さは w。
+     */
+
+    /** src の行 so + i * ss (i = 0..7) を変換して dst の行 dOff + i * ds に書く */
+    private fun idct8Cols(src: FloatArray, so: Int, ss: Int, dst: FloatArray, dOff: Int, ds: Int, w: Int) {
+        val sec0 = 0.5411961f
+        val sec1 = 1.306563f
+        val k0 = SEC8[0]
+        val k1 = SEC8[1]
+        val k2 = SEC8[2]
+        val k3 = SEC8[3]
+        for (x in 0 until w) {
+            val i = so + x
+            // 偶数番目
+            val e0 = src[i]
+            val e1 = src[i + 2 * ss]
+            val e2 = src[i + 4 * ss]
+            val e3 = src[i + 6 * ss]
+            var t0 = e1 * SQRT2
+            var t1 = e1 + e3
+            var o0 = (t0 + t1) * sec0
+            var o1 = (t0 - t1) * sec1
+            var s02 = e0 + e2
+            var d02 = e0 - e2
+            val a0 = s02 + o0
+            val a1 = d02 + o1
+            val a2 = d02 - o1
+            val a3 = s02 - o0
+            // 奇数番目
+            val r1 = src[i + ss]
+            val r3 = src[i + 3 * ss]
+            val r5 = src[i + 5 * ss]
+            val q0 = r1 * SQRT2
+            val q1 = r3 + r1
+            val q2 = r5 + r3
+            val q3 = src[i + 7 * ss] + r5
+            t0 = q1 * SQRT2
+            t1 = q1 + q3
+            o0 = (t0 + t1) * sec0
+            o1 = (t0 - t1) * sec1
+            s02 = q0 + q2
+            d02 = q0 - q2
+            val b0 = (s02 + o0) * k0
+            val b1 = (d02 + o1) * k1
+            val b2 = (d02 - o1) * k2
+            val b3 = (s02 - o0) * k3
+            val j = dOff + x
+            dst[j] = a0 + b0
+            dst[j + 7 * ds] = a0 - b0
+            dst[j + ds] = a1 + b1
+            dst[j + 6 * ds] = a1 - b1
+            dst[j + 2 * ds] = a2 + b2
+            dst[j + 5 * ds] = a2 - b2
+            dst[j + 3 * ds] = a3 + b3
+            dst[j + 4 * ds] = a3 - b3
+        }
+    }
+
+    /** src の行 so + i * ss (i = 0..15) を変換して dst の行 dOff + i * ds に書く。t1・t2 (16 行) は作業領域 */
+    private fun idct16Cols(
+        src: FloatArray, so: Int, ss: Int, dst: FloatArray, dOff: Int, ds: Int, w: Int, t1: FloatArray, t2: FloatArray,
+    ) {
+        // 偶数番目の行を t1 の行 0..7 に、奇数番目の行を隣と足して 8..15 に (idct16 の並べ替えと前処理)
+        for (i in 0 until 8) System.arraycopy(src, so + 2 * i * ss, t1, i * w, w)
+        for (x in 0 until w) t1[8 * w + x] = src[so + ss + x] * SQRT2
+        for (i in 1 until 8) {
+            val a = so + (2 * i + 1) * ss
+            val b = so + (2 * i - 1) * ss
+            val o = (8 + i) * w
+            for (x in 0 until w) t1[o + x] = src[a + x] + src[b + x]
+        }
+        idct8Cols(t1, 0, w, t2, 0, w, w)
+        idct8Cols(t1, 8 * w, w, t2, 8 * w, w, w)
+        for (i in 0 until 8) {
+            val sec = SEC16[i]
+            val a = i * w
+            val b = (8 + i) * w
+            val o1 = dOff + i * ds
+            val o2 = dOff + (15 - i) * ds
+            for (x in 0 until w) {
+                val va = t2[a + x]
+                val vb = t2[b + x] * sec
+                dst[o1 + x] = va + vb
+                dst[o2 + x] = va - vb
+            }
+        }
+    }
+
+    /** buf の行 base + i * stride (i = 0..31) をその場で変換する */
+    private fun idct32Cols(buf: FloatArray, base: Int, stride: Int, w: Int, cs: ColScratch) {
+        val t = cs.a
+        for (i in 0 until 16) System.arraycopy(buf, base + 2 * i * stride, t, i * w, w)
+        for (x in 0 until w) t[16 * w + x] = buf[base + stride + x] * SQRT2
+        for (i in 1 until 16) {
+            val a = base + (2 * i + 1) * stride
+            val b = base + (2 * i - 1) * stride
+            val o = (16 + i) * w
+            for (x in 0 until w) t[o + x] = buf[a + x] + buf[b + x]
+        }
+        // 前半・後半の 16 行をそれぞれ 16 点の変換にかけて d に置く
+        val d = cs.d
+        idct16Cols(t, 0, w, d, 0, w, w, cs.b, cs.c)
+        idct16Cols(t, 16 * w, w, d, 16 * w, w, w, cs.b, cs.c)
+        for (i in 0 until 16) {
+            val sec = SEC32[i]
+            val a = i * w
+            val b = (16 + i) * w
+            val o1 = base + i * stride
+            val o2 = base + (31 - i) * stride
+            for (x in 0 until w) {
+                val va = d[a + x]
+                val vb = d[b + x] * sec
+                buf[o1 + x] = va + vb
+                buf[o2 + x] = va - vb
+            }
         }
     }
 
@@ -344,6 +498,7 @@ internal object Dct {
 
     /** 小さい変換の作業領域 (ブロックごとに確保しないため) */
     class Scratch {
+        val cols = ColScratch()
         val s = FloatArray(64)
         val sc = FloatArray(16)
         val coeff = FloatArray(16)
