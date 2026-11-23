@@ -254,18 +254,13 @@ internal class FrameDecoder(
             }
         } catch (e: Throwable) {
             // 失敗したら HfGlobal の終わりを待ってから投げる (このフレームの状態を後から書き換えさせない)
-            try {
-                hfGlobalTask?.get()
-            } catch (_: Exception) {
-            }
+            if (hfGlobalTask != null) awaitFully(hfGlobalTask)
             throw e
         }
         if (hfGlobalTask != null) {
-            try {
-                hfGlobalTask.get()
-            } catch (e: java.util.concurrent.ExecutionException) {
-                throw e.cause ?: e
-            }
+            val r = awaitFully(hfGlobalTask)
+            if (r.error != null) throw r.error
+            if (r.interrupted) throw InterruptedException()
             phase("hfGlobal")
         } else if (vardct) {
             val br = hfGlobalSection()
@@ -298,6 +293,32 @@ internal class FrameDecoder(
             return null
         }
         return render(modularChannels)
+    }
+
+    private class AwaitResult(val error: Throwable?, val interrupted: Boolean)
+
+    /**
+     * 割り込まれても [task] が終わるまで待つ (待っている間に割り込まれたら、終わってから割り込みの状態を戻す)。
+     * 復号が先に終わって、別のスレッドがフレームの状態を後から書き換えることがないようにする
+     */
+    private fun awaitFully(task: java.util.concurrent.Future<*>): AwaitResult {
+        var interrupted = false
+        try {
+            while (true) {
+                try {
+                    task.get()
+                    return AwaitResult(null, interrupted)
+                } catch (_: InterruptedException) {
+                    interrupted = true
+                } catch (e: java.util.concurrent.ExecutionException) {
+                    return AwaitResult(e.cause ?: e, interrupted)
+                } catch (e: java.util.concurrent.CancellationException) {
+                    return AwaitResult(e, interrupted)
+                }
+            }
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt()
+        }
     }
 
     // ---------------- LfGlobal ----------------
