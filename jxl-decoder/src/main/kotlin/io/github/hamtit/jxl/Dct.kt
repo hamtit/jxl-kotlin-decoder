@@ -312,7 +312,7 @@ internal object Dct {
         for (y in 0 until rows) dctInPlace(buf, base + y * stride, w, scratch, 0, false)
         // 列方向は、幅 16 以上で高さ 32 以下なら列をまとめて (行どうしの演算で) 変換する
         if (w >= 16 && h <= 32) {
-            cs.ensure(w)
+            if (h > 8) cs.ensure(w)
             for (y in rows until h) buf.fill(0f, base + y * stride, base + y * stride + w)
             when (h) {
                 8 -> idct8Cols(buf, base, stride, buf, base, stride, w)

@@ -434,7 +434,7 @@ internal object Filters {
                 bx = runEnd
                 while (bx < w) {
                     val s = if (sig != null) sig[sRow + (bx shr 3)] else p.sigmaForModular
-                    if (s >= 0.3f) break
+                    if (!(s < 0.3f)) break
                     val xEnd = minOf(w, bx + 8)
                     System.arraycopy(i0, pm + bx + 3, o0, o + bx + 3, xEnd - bx)
                     System.arraycopy(i1, pm + bx + 3, o1, o + bx + 3, xEnd - bx)
