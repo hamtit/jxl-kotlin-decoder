@@ -81,6 +81,15 @@ internal class BitReader(private val data: ByteArray, private val start: Int, pr
         return v
     }
 
+    /** 16 ビットを読む (ANS の状態補充の高速版) */
+    fun readBits16(): Int {
+        if (bits < 16) refill()
+        val v = (buf and 0xffffL).toInt()
+        buf = buf ushr 16
+        bits -= 16
+        return v
+    }
+
     fun readBool(): Boolean = readBits(1) == 1
 
     /** U32(d0, d1, d2, d3)。各分布は (offset, bits) で表す */

@@ -88,14 +88,16 @@ internal object Tt {
 
 /** 逆量子化行列 */
 internal class QuantMatrices(
-    /** [matrix][channel] = 行列 (MATRIX_W x MATRIX_H、行優先) */
-    private val matrices: Array<Array<FloatArray>>,
+    /** [matrix][channel] = 行列 (MATRIX_W x MATRIX_H、行優先)。null の要素は既定の行列を使う (遅延生成) */
+    private val matrices: Array<Array<FloatArray>?>,
 ) {
     private val transposed = java.util.concurrent.atomic.AtomicReferenceArray<FloatArray>(17 * 3)
 
+    private fun matrix(m: Int): Array<FloatArray> = matrices[m] ?: defaultMatrix(m)
+
     private fun transposedMatrix(m: Int, c: Int): FloatArray {
         transposed.get(m * 3 + c)?.let { return it }
-        val src = matrices[m][c]
+        val src = matrix(m)[c]
         val w = Tt.MATRIX_W[m]
         val h = Tt.MATRIX_H[m]
         val out = FloatArray(src.size)
@@ -108,7 +110,7 @@ internal class QuantMatrices(
     /** 変換 [t] の係数配置 (幅 BW*8) に合わせた行列 */
     fun get(t: Int, c: Int): FloatArray {
         val m = Tt.MATRIX[t]
-        return if (Tt.needTranspose(t)) transposedMatrix(m, c) else matrices[m][c]
+        return if (Tt.needTranspose(t)) transposedMatrix(m, c) else matrix(m)[c]
     }
 
     companion object {
@@ -344,18 +346,14 @@ internal class QuantMatrices(
             return defaultMatrices.get(m)
         }
 
-        @Volatile
-        private var defaultSet: QuantMatrices? = null
+        private val defaultSet = QuantMatrices(arrayOfNulls(17))
 
         fun parse(br: BitReader, numLfGroups: Int, globalTree: MaTree?, bitDepth: Int): QuantMatrices {
             val all = br.readBool()
-            if (all) {
-                defaultSet?.let { return it }
-                return QuantMatrices(Array(17) { defaultMatrix(it) }).also { defaultSet = it }
-            }
-            val list = Array(17) { m ->
+            if (all) return defaultSet
+            val list = Array<Array<FloatArray>?>(17) { m ->
                 val params = readParams(br, m, numLfGroups, globalTree, bitDepth)
-                if (params == null) defaultMatrix(m) else toMatrix(m, params)
+                if (params == null) null else toMatrix(m, params)
             }
             return QuantMatrices(list)
         }

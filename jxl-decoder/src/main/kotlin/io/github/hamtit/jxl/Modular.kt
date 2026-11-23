@@ -148,8 +148,10 @@ internal class MaTree(
         l.toArray()
     }
 
-    /** [specialize] の結果。チャンネル・ストリームでの分岐の結果が同じなら同じ木になる */
-    private val specialized = java.util.concurrent.ConcurrentHashMap<BranchKey, MaTree>()
+    /** [specialize] の結果。チャンネル・ストリームでの分岐の結果が同じなら同じ木になる (使う木だけ確保する) */
+    private val specialized: java.util.concurrent.ConcurrentHashMap<BranchKey, MaTree> by lazy(LazyThreadSafetyMode.PUBLICATION) {
+        java.util.concurrent.ConcurrentHashMap()
+    }
 
     private class BranchKey(val bits: LongArray) {
         private val hash = bits.contentHashCode()
@@ -200,7 +202,7 @@ internal class MaTree(
             }
             reader.finish()
             val code = EntropyCode.parse(br, numCtx)
-            val clusters = IntArray(prop.size) { if (prop[it] < 0) code.clusters[ctx[it]] else 0 }
+            val clusters = IntArray(prop.size) { if (prop[it] < 0) code.clusters[ctx[it]].toInt() and 0xff else 0 }
             return MaTree(
                 prop.toArray(), split.toArray(), left.toArray(), right.toArray(), pred.toArray(), off.toArray(),
                 mul.toArray(), clusters, code,
