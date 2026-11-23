@@ -148,8 +148,11 @@ internal class FrameDecoder(
     private var bw = 0
     private var bh = 0
     private lateinit var lfPlanes: Array<Plane>
-    private var lfQuant: Array<IntArray>? = null
-    private var lfQuantW = IntArray(3)
+    /**
+     * ブロックごとの、LF の量子化値から決まる HF の文脈の番号 (BlockContextMap の LF のしきい値で分けたもの)。
+     * しきい値がない (既定の文脈の表など) か LF フレームを使うなら null (常に 0)
+     */
+    private var lfCtx: ByteArray? = null
     private lateinit var dctSelect: ByteArray
     private lateinit var hfMul: IntArray
     private lateinit var epfSigma: FloatArray
@@ -423,10 +426,7 @@ internal class FrameDecoder(
         xFromY = IntArray(tilesW * tilesH)
         bFromY = IntArray(tilesW * tilesH)
         lfPlanes = Array(3) { c -> Plane(bw shr hShift[c], bh shr vShift[c]) }
-        if (!header.useLfFrame) {
-            lfQuant = Array(3) { c -> IntArray((bw shr hShift[c]) * (bh shr vShift[c])) }
-            for (c in 0 until 3) lfQuantW[c] = bw shr hShift[c]
-        }
+        if (!header.useLfFrame && lfGlobal.blockCtx!!.lfThresholds.any { it.isNotEmpty() }) lfCtx = ByteArray(n)
     }
 
     private fun decodeLfGroup(idx: Int, br: BitReader) {
@@ -457,7 +457,6 @@ internal class FrameDecoder(
                 val ch = out[k]
                 val scale = (m[c] * precision / scaleInv).toFloat()
                 val plane = lfPlanes[c]
-                val q = lfQuant!![c]
                 val bx0 = (x0 / 8) shr hShift[c]
                 val by0 = (y0 / 8) shr vShift[c]
                 for (y in 0 until ch.height) {
@@ -466,10 +465,34 @@ internal class FrameDecoder(
                     for (x in 0 until ch.width) {
                         val px = bx0 + x
                         if (px >= plane.width) break
-                        val v = ch.data[y * ch.width + x]
-                        plane.data[py * plane.width + px] = v * scale
-                        q[py * plane.width + px] = v
+                        plane.data[py * plane.width + px] = ch.data[y * ch.width + x] * scale
                     }
+                }
+            }
+            lfCtx?.let { lc ->
+                // ブロックごとに、3 チャンネルの量子化値をしきい値で分けた文脈の番号を求めておく (X・B・Y の順)
+                val th = lfGlobal.blockCtx!!.lfThresholds
+                val bx0 = x0 / 8
+                val by0 = y0 / 8
+                val bx1 = minOf(bw, bx0 + gd)
+                val by1 = minOf(bh, by0 + gd)
+                val ctxOrder = intArrayOf(0, 2, 1)
+                // チャンネル c の復号結果は out[order の中の c の位置]
+                val chOf = Array(3) { c -> out[order.indexOf(c)] }
+                for (by in by0 until by1) for (bx in bx0 until bx1) {
+                    var idx = 0
+                    for (c in ctxOrder) {
+                        val ch = chOf[c]
+                        val qx = (bx shr hShift[c]) - (bx0 shr hShift[c])
+                        val qy = (by shr vShift[c]) - (by0 shr vShift[c])
+                        val t = th[c]
+                        idx *= t.size + 1
+                        if (qx < ch.width && qy < ch.height) {
+                            val q = ch.data[qy * ch.width + qx]
+                            for (v in t) if (q > v) idx++
+                        }
+                    }
+                    lc[by * bw + bx] = idx.toByte()
                 }
             }
         }
@@ -587,7 +610,9 @@ internal class FrameDecoder(
         val sSelf = 0.052262735f
         val sSide = 0.2034514f
         val sDiag = 0.03348292f
-        val src = Array(3) { lfPlanes[it].data.copyOf() }
+        // 書き換える前の値は、1 つ上の行と今の行だけ退避しておけばよい (下の行はまだ書き換えていない)
+        var up = Array(3) { lfPlanes[it].data.copyOfRange(0, w) }
+        var mid = Array(3) { lfPlanes[it].data.copyOfRange(w, 2 * w) }
         val dst = Array(3) { lfPlanes[it].data }
         val mul = floatArrayOf(lfx, lfy, lfb)
         val wa = FloatArray(3)
@@ -596,11 +621,13 @@ internal class FrameDecoder(
             for (x in 1 until w - 1) {
                 var gap = 0.5f
                 for (c in 0 until 3) {
-                    val s = src[c]
-                    val i = y * w + x
-                    val v = s[i]
-                    val side = s[i - 1] + s[i + 1] + s[i - w] + s[i + w]
-                    val diag = s[i - w - 1] + s[i - w + 1] + s[i + w - 1] + s[i + w + 1]
+                    val u = up[c]
+                    val m = mid[c]
+                    val d = dst[c]
+                    val i = (y + 1) * w + x
+                    val v = m[x]
+                    val side = m[x - 1] + m[x + 1] + u[x] + d[i]
+                    val diag = u[x - 1] + u[x + 1] + d[i - 1] + d[i + 1]
                     val a = v * sSelf + side * sSide + diag * sDiag
                     wa[c] = a
                     self[c] = v
@@ -610,6 +637,11 @@ internal class FrameDecoder(
                 val gs = maxOf(0f, 3f - 4f * gap)
                 for (c in 0 until 3) dst[c][y * w + x] = (wa[c] - self[c]) * gs + self[c]
             }
+            // 次の行のために、書き換えた今の行の元の値を上の行に回し、次の行 (まだ元の値) を退避する
+            val t = up
+            up = mid
+            mid = t
+            if (y + 1 < h - 1) for (c in 0 until 3) System.arraycopy(dst[c], (y + 1) * w, mid[c], 0, w)
         }
     }
 
@@ -779,8 +811,7 @@ internal class FrameDecoder(
         val bx0 = gx * (gd / 8)
         val by0 = gy * (gd / 8)
         val cOrder = intArrayOf(1, 0, 2)
-        val lfOrder = intArrayOf(0, 2, 1)
-        val lq = lfQuant
+        val lc = lfCtx
         for (y in 0 until gbh) {
             for (x in 0 until gbw) {
                 val pos = (by0 + y) * bw + bx0 + x
@@ -792,17 +823,7 @@ internal class FrameDecoder(
                 val numBlocks = w8 * h8
                 val logNb = Integer.numberOfTrailingZeros(numBlocks)
                 val orderId = Tt.ORDER[t]
-                var lfIdx = 0
-                if (lq != null) {
-                    for (c in lfOrder) {
-                        val th = ctx.lfThresholds[c]
-                        lfIdx *= th.size + 1
-                        val qx = (bx0 + x) shr hShift[c]
-                        val qy = (by0 + y) shr vShift[c]
-                        val q = lq[c][qy * lfQuantW[c] + qx]
-                        for (v in th) if (q > v) lfIdx++
-                    }
-                }
+                val lfIdx = if (lc != null) lc[pos].toInt() else 0
                 var hfIdx = 0
                 for (v in ctx.qfThresholds) if (qf > v) hfIdx++
                 for (ci in 0 until 3) {
