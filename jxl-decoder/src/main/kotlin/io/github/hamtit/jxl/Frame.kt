@@ -148,8 +148,11 @@ internal class FrameDecoder(
     private var bw = 0
     private var bh = 0
     private lateinit var lfPlanes: Array<Plane>
-    private var lfQuant: Array<IntArray>? = null
-    private var lfQuantW = IntArray(3)
+    /**
+     * ブロックごとの、LF の量子化値から決まる HF の文脈の番号 (BlockContextMap の LF のしきい値で分けたもの)。
+     * しきい値がない (既定の文脈の表など) か LF フレームを使うなら null (常に 0)
+     */
+    private var lfCtx: ByteArray? = null
     private lateinit var dctSelect: ByteArray
     private lateinit var hfMul: IntArray
     private lateinit var epfSigma: FloatArray
@@ -423,10 +426,7 @@ internal class FrameDecoder(
         xFromY = IntArray(tilesW * tilesH)
         bFromY = IntArray(tilesW * tilesH)
         lfPlanes = Array(3) { c -> Plane(bw shr hShift[c], bh shr vShift[c]) }
-        if (!header.useLfFrame) {
-            lfQuant = Array(3) { c -> IntArray((bw shr hShift[c]) * (bh shr vShift[c])) }
-            for (c in 0 until 3) lfQuantW[c] = bw shr hShift[c]
-        }
+        if (!header.useLfFrame && lfGlobal.blockCtx!!.lfThresholds.any { it.isNotEmpty() }) lfCtx = ByteArray(n)
     }
 
     private fun decodeLfGroup(idx: Int, br: BitReader) {
@@ -457,7 +457,6 @@ internal class FrameDecoder(
                 val ch = out[k]
                 val scale = (m[c] * precision / scaleInv).toFloat()
                 val plane = lfPlanes[c]
-                val q = lfQuant!![c]
                 val bx0 = (x0 / 8) shr hShift[c]
                 val by0 = (y0 / 8) shr vShift[c]
                 for (y in 0 until ch.height) {
@@ -466,10 +465,34 @@ internal class FrameDecoder(
                     for (x in 0 until ch.width) {
                         val px = bx0 + x
                         if (px >= plane.width) break
-                        val v = ch.data[y * ch.width + x]
-                        plane.data[py * plane.width + px] = v * scale
-                        q[py * plane.width + px] = v
+                        plane.data[py * plane.width + px] = ch.data[y * ch.width + x] * scale
                     }
+                }
+            }
+            lfCtx?.let { lc ->
+                // ブロックごとに、3 チャンネルの量子化値をしきい値で分けた文脈の番号を求めておく (X・B・Y の順)
+                val th = lfGlobal.blockCtx!!.lfThresholds
+                val bx0 = x0 / 8
+                val by0 = y0 / 8
+                val bx1 = minOf(bw, bx0 + gd)
+                val by1 = minOf(bh, by0 + gd)
+                val ctxOrder = intArrayOf(0, 2, 1)
+                // チャンネル c の復号結果は out[order の中の c の位置]
+                val chOf = Array(3) { c -> out[order.indexOf(c)] }
+                for (by in by0 until by1) for (bx in bx0 until bx1) {
+                    var idx = 0
+                    for (c in ctxOrder) {
+                        val ch = chOf[c]
+                        val qx = (bx shr hShift[c]) - (bx0 shr hShift[c])
+                        val qy = (by shr vShift[c]) - (by0 shr vShift[c])
+                        val t = th[c]
+                        idx *= t.size + 1
+                        if (qx < ch.width && qy < ch.height) {
+                            val q = ch.data[qy * ch.width + qx]
+                            for (v in t) if (q > v) idx++
+                        }
+                    }
+                    lc[by * bw + bx] = idx.toByte()
                 }
             }
         }
@@ -587,7 +610,9 @@ internal class FrameDecoder(
         val sSelf = 0.052262735f
         val sSide = 0.2034514f
         val sDiag = 0.03348292f
-        val src = Array(3) { lfPlanes[it].data.copyOf() }
+        // 書き換える前の値は、1 つ上の行と今の行だけ退避しておけばよい (下の行はまだ書き換えていない)
+        var up = Array(3) { lfPlanes[it].data.copyOfRange(0, w) }
+        var mid = Array(3) { lfPlanes[it].data.copyOfRange(w, 2 * w) }
         val dst = Array(3) { lfPlanes[it].data }
         val mul = floatArrayOf(lfx, lfy, lfb)
         val wa = FloatArray(3)
@@ -596,11 +621,13 @@ internal class FrameDecoder(
             for (x in 1 until w - 1) {
                 var gap = 0.5f
                 for (c in 0 until 3) {
-                    val s = src[c]
-                    val i = y * w + x
-                    val v = s[i]
-                    val side = s[i - 1] + s[i + 1] + s[i - w] + s[i + w]
-                    val diag = s[i - w - 1] + s[i - w + 1] + s[i + w - 1] + s[i + w + 1]
+                    val u = up[c]
+                    val m = mid[c]
+                    val d = dst[c]
+                    val i = (y + 1) * w + x
+                    val v = m[x]
+                    val side = m[x - 1] + m[x + 1] + u[x] + d[i]
+                    val diag = u[x - 1] + u[x + 1] + d[i - 1] + d[i + 1]
                     val a = v * sSelf + side * sSide + diag * sDiag
                     wa[c] = a
                     self[c] = v
@@ -610,6 +637,11 @@ internal class FrameDecoder(
                 val gs = maxOf(0f, 3f - 4f * gap)
                 for (c in 0 until 3) dst[c][y * w + x] = (wa[c] - self[c]) * gs + self[c]
             }
+            // 次の行のために、書き換えた今の行の元の値を上の行に回し、次の行 (まだ元の値) を退避する
+            val t = up
+            up = mid
+            mid = t
+            if (y + 1 < h - 1) for (c in 0 until 3) System.arraycopy(dst[c], (y + 1) * w, mid[c], 0, w)
         }
     }
 
@@ -659,10 +691,31 @@ internal class FrameDecoder(
             gbw = minOf(gd / 8, bw - gx * (gd / 8))
             gbh = minOf(gd / 8, bh - gy * (gd / 8))
             gs = GroupScratch.obtain(minOf(gd, bw * 8) * minOf(gd, bh * 8), header.passes.numPasses > 1)
+            // 係数は書き込み先 (帯または色平面) のグループの場所に直接置き、その場で逆変換する
+            val bx0 = gx * (gd / 8)
+            val by0 = gy * (gd / 8)
             for (c in 0 until 3) {
-                val n = ((gbw shr hShift[c]) * 8) * ((gbh shr vShift[c]) * 8)
-                gs.coeffs[c].fill(0f, 0, n)
-                gs.intCoeffs?.get(c)?.fill(0, 0, n)
+                val cw = (gbw shr hShift[c]) * 8
+                val chh = (gbh shr vShift[c]) * 8
+                val px0 = (bx0 shr hShift[c]) * 8
+                val py0 = (by0 shr vShift[c]) * 8
+                if (target != null) {
+                    gs.out[c] = target[c]
+                    gs.outStride[c] = bw * 8
+                    gs.outBase[c] = (py0 - targetY0) * (bw * 8) + px0
+                } else {
+                    val plane = colorPlanes!![c]
+                    gs.out[c] = plane.data
+                    gs.outStride[c] = plane.width
+                    gs.outBase[c] = py0 * plane.width + px0
+                }
+                val o = gs.out[c]!!
+                for (y in 0 until chh) {
+                    val r = gs.outBase[c] + y * gs.outStride[c]
+                    o.fill(0f, r, r + cw)
+                }
+                gs.intCoeffs?.get(c)?.fill(0, 0, cw * chh)
+                gs.nzRows[c].fill(0, 0, cw * chh / 64)
             }
         }
         try {
@@ -678,13 +731,17 @@ internal class FrameDecoder(
                 // 複数のパスの係数は整数で足し合わせてから、一度だけ浮動小数点にする
                 gs!!.intCoeffs?.let { ints ->
                     for (c in 0 until 3) {
-                        val n = ((gbw shr hShift[c]) * 8) * ((gbh shr vShift[c]) * 8)
+                        val cw = (gbw shr hShift[c]) * 8
+                        val chh = (gbh shr vShift[c]) * 8
                         val src = ints[c]
-                        val dst = gs.coeffs[c]
-                        for (i in 0 until n) dst[i] = src[i].toFloat()
+                        val dst = gs.out[c]!!
+                        for (y in 0 until chh) {
+                            val r = gs.outBase[c] + y * gs.outStride[c]
+                            for (x in 0 until cw) dst[r + x] = src[y * cw + x].toFloat()
+                        }
                     }
                 }
-                reconstructGroup(gx, gy, gbw, gbh, gs, target, targetY0)
+                reconstructGroup(gx, gy, gbw, gbh, gs)
             }
         } finally {
             gs?.recycle()
@@ -692,34 +749,51 @@ internal class FrameDecoder(
     }
 
     /**
-     * グループの係数と逆変換の作業領域。グループごと・フレームごとに確保せず、[ScratchPool] に置いて使い回す。
-     * パスが 1 つなら、量子化された係数 (整数) を浮動小数点の配列に直接書き、その場で逆量子化する
+     * グループの逆変換の作業領域。グループごと・フレームごとに確保せず、[ScratchPool] に置いて使い回す。
+     * 係数は書き込み先 ([out] の [outBase] から、行の長さ [outStride]) のグループの場所に直接置き、その場で逆変換する。
+     * パスが 1 つなら、量子化された係数 (整数) を読んだその場で逆量子化して書く
      * (各係数は一度だけ書かれるので、整数から変換するのと同じ値になる)。
-     * 複数のパスがあるときは [intCoeffs] に整数で足し合わせる
+     * 複数のパスがあるときは [intCoeffs] (グループの幅を行の長さとする) に整数で足し合わせる
      */
-    private class GroupScratch(size: Int, multiPass: Boolean) {
-        val coeffs = Array(3) { FloatArray(size) }
+    private class GroupScratch(val size: Int, multiPass: Boolean) {
+        val out = arrayOfNulls<FloatArray>(3)
+        val outBase = IntArray(3)
+        val outStride = IntArray(3)
         val intCoeffs: Array<IntArray>? = if (multiPass) Array(3) { IntArray(size) } else null
+        /**
+         * ブロック (チャンネルごと、グループ内のブロック座標 y * 幅 + x) の HF 係数のうち 0 でないものがある行の数
+         * (係数の配置での上からの行数。0 なら HF 係数はすべて 0)。逆 DCT で 0 だけの行を飛ばすのに使う
+         */
+        val nzRows = Array(3) { IntArray(maxOf(1, size / 64)) }
         val scratch = FloatArray(512)
         val tmp = FloatArray(64)
         val lfBuf = FloatArray(32 * 32)
         val dct = Dct.Scratch()
 
-        fun recycle() = ScratchPool.give(this, coeffs[0].size * (if (intCoeffs != null) 24L else 12L) + 8192L)
+        fun recycle() {
+            out.fill(null)
+            ScratchPool.give(this, size * (if (intCoeffs != null) 12L else 0L) + size * 3L / 16 + 8192L + dct.cols.bytes())
+        }
 
         companion object {
             fun obtain(size: Int, multiPass: Boolean): GroupScratch =
                 ScratchPool.take(GroupScratch::class.java) {
                     // 大きすぎるもの (大きいグループ用) を小さい画像に使わない
-                    it.coeffs[0].size >= size && it.coeffs[0].size / 4 <= size && (!multiPass || it.intCoeffs != null)
+                    it.size >= size && it.size / 4 <= size && (!multiPass || it.intCoeffs != null)
                 } ?: GroupScratch(size, multiPass)
         }
     }
 
     private fun decodeHfCoefficients(br: BitReader, pass: Int, gx: Int, gy: Int, gbw: Int, gbh: Int, gs: GroupScratch) {
-        val outF = gs.coeffs
         val outI = gs.intCoeffs
+        val nzRows = gs.nzRows
         val ctx = lfGlobal.blockCtx!!
+        // パスが 1 つなら、係数を読んだその場で逆量子化する (reconstructGroup で全係数を見直さない)
+        val qm = quantMatrices!!
+        val qmScale = qmScales()
+        val qb = image.quantBias
+        val qbn = image.quantBiasNumerator
+        val globalScale = lfGlobal.globalScale.toFloat()
         val hfPass = hfPasses[pass]
         val shift = if (pass < header.passes.shift.size) header.passes.shift[pass] else 0
         val hfpBits = addLog2Ceil(numHfPresets - 1)
@@ -737,8 +811,7 @@ internal class FrameDecoder(
         val bx0 = gx * (gd / 8)
         val by0 = gy * (gd / 8)
         val cOrder = intArrayOf(1, 0, 2)
-        val lfOrder = intArrayOf(0, 2, 1)
-        val lq = lfQuant
+        val lc = lfCtx
         for (y in 0 until gbh) {
             for (x in 0 until gbw) {
                 val pos = (by0 + y) * bw + bx0 + x
@@ -750,17 +823,7 @@ internal class FrameDecoder(
                 val numBlocks = w8 * h8
                 val logNb = Integer.numberOfTrailingZeros(numBlocks)
                 val orderId = Tt.ORDER[t]
-                var lfIdx = 0
-                if (lq != null) {
-                    for (c in lfOrder) {
-                        val th = ctx.lfThresholds[c]
-                        lfIdx *= th.size + 1
-                        val qx = (bx0 + x) shr hShift[c]
-                        val qy = (by0 + y) shr vShift[c]
-                        val q = lq[c][qy * lfQuantW[c] + qx]
-                        for (v in th) if (q > v) lfIdx++
-                    }
-                }
+                val lfIdx = if (lc != null) lc[pos].toInt() else 0
                 var hfIdx = 0
                 for (v in ctx.qfThresholds) if (qf > v) hfIdx++
                 for (ci in 0 until 3) {
@@ -795,7 +858,9 @@ internal class FrameDecoder(
                         if (sx + dx < nzr.size) nzr[sx + dx] = nzVal
                     }
                     if (nonZeros == 0) continue
-                    val coeffF = outF[c]
+                    val coeffF = gs.out[c]!!
+                    val fBase = gs.outBase[c] + sy * 8 * gs.outStride[c] + sx * 8
+                    val fStride = gs.outStride[c]
                     val coeffI = outI?.get(c)
                     val cw = (gbw shr hs) * 8
                     var prevNz = if (nonZeros <= numBlocks * 4) 1 else 0
@@ -804,6 +869,11 @@ internal class FrameDecoder(
                     val transpose = Tt.needTranspose(t)
                     val coeffBase = ctxBase + blockCtx * 458 + 37 * ctx.numClusters
                     val size = order.size
+                    val m = qm.get(t, c)
+                    val bwv = w8 * 8
+                    val scale = 65536f / (globalScale * qf) * qmScale[c]
+                    val qbc = qb[c]
+                    var rows = 0
                     var k = numBlocks
                     while (k < size) {
                         val i = k - numBlocks
@@ -823,45 +893,48 @@ internal class FrameDecoder(
                         if (transpose) {
                             val tmp = dx; dx = dy; dy = tmp
                         }
-                        val ci = (sy * 8 + dy) * cw + sx * 8 + dx
-                        if (coeffI != null) coeffI[ci] += v else coeffF[ci] = v.toFloat()
+                        if (coeffI != null) {
+                            coeffI[(sy * 8 + dy) * cw + sx * 8 + dx] += v
+                        } else {
+                            // 各係数は一度だけ書かれるので、整数のまま足し合わせてから逆量子化するのと同じ値になる
+                            val q = v.toFloat()
+                            val dq = if (q == 1f || q == -1f) q * qbc else q - qbn / q
+                            coeffF[fBase + dy * fStride + dx] = dq * m[dy * bwv + dx] * scale
+                        }
+                        if (dy >= rows) rows = dy + 1
                         prevNz = 1
                         nonZeros--
                         if (nonZeros == 0) break
                         k++
                     }
                     if (nonZeros != 0) fail("too many zeros in varblock")
+                    val bi = sy * (gbw shr hs) + sx
+                    if (rows > nzRows[c][bi]) nzRows[c][bi] = rows
                 }
             }
         }
         reader.finish()
     }
 
-    /** 逆量子化・CfL・逆 DCT をして色平面に書き込む */
-    private fun reconstructGroup(
-        gx: Int, gy: Int, gbw: Int, gbh: Int, gs: GroupScratch, target: Array<FloatArray>?, targetY0: Int,
-    ) {
-        val coeffs = gs.coeffs
+    /** 書き込み先に置いた係数を逆量子化 (複数パスのとき)・CfL・逆 DCT する */
+    private fun reconstructGroup(gx: Int, gy: Int, gbw: Int, gbh: Int, gs: GroupScratch) {
         val qm = quantMatrices!!
         val bx0 = gx * (gd / 8)
         val by0 = gy * (gd / 8)
-        val qmScale = floatArrayOf(
-            Math.pow(0.8, (header.xQmScale - 2).toDouble()).toFloat(), 1f,
-            Math.pow(0.8, (header.bQmScale - 2).toDouble()).toFloat(),
-        )
-        val fcoeff = coeffs
+        val qmScale = qmScales()
         val qb = image.quantBias
         val qbn = image.quantBiasNumerator
-        for (c in 0 until 3) {
-            val cw = (gbw shr hShift[c]) * 8
-            val dst = coeffs[c]
+        // パスが 1 つなら係数は読んだときに逆量子化してある
+        if (gs.intCoeffs != null) for (c in 0 until 3) {
+            val stride = gs.outStride[c]
+            val dst = gs.out[c]!!
             forEachVarblock(c, gbw, gbh, bx0, by0) { sx, sy, t, mul ->
                 val bwv = Tt.BW[t] * 8
                 val bhv = Tt.BH[t] * 8
                 val m = qm.get(t, c)
                 val scale = 65536f / (lfGlobal.globalScale.toFloat() * mul) * qmScale[c]
                 for (yy in 0 until bhv) {
-                    val row = (sy * 8 + yy) * cw + sx * 8
+                    val row = gs.outBase[c] + (sy * 8 + yy) * stride + sx * 8
                     val mrow = yy * bwv
                     for (xx in 0 until bwv) {
                         val qf = dst[row + xx]
@@ -876,9 +949,15 @@ internal class FrameDecoder(
         if (maxHs == 0 && maxVs == 0) {
             val cw = gbw * 8
             val ch = gbh * 8
-            val fx = fcoeff[0]
-            val fy = fcoeff[1]
-            val fb = fcoeff[2]
+            val fx = gs.out[0]!!
+            val fy = gs.out[1]!!
+            val fb = gs.out[2]!!
+            // サブサンプリングがなければ 3 チャンネルとも同じ位置・行の長さ
+            val o0 = gs.outBase[0]
+            val stride = gs.outStride[0]
+            if (gs.outBase[1] != o0 || gs.outBase[2] != o0 || gs.outStride[1] != stride || gs.outStride[2] != stride) {
+                error("channel layout mismatch")
+            }
             val tx0 = gx * gd / 64
             val ty0 = gy * gd / 64
             val cf = lfGlobal.colourFactor.toFloat()
@@ -889,7 +968,7 @@ internal class FrameDecoder(
                     val kx = lfGlobal.baseCorrX + xFromY[ti] / cf
                     val kb = lfGlobal.baseCorrB + bFromY[ti] / cf
                     val xEnd = minOf(cw, x64 * 64 + 64)
-                    val row = y * cw
+                    val row = o0 + y * stride
                     for (x in x64 * 64 until xEnd) {
                         val yv = fy[row + x]
                         fx[row + x] += kx * yv
@@ -903,15 +982,21 @@ internal class FrameDecoder(
         val tmp = gs.tmp
         val lfBuf = gs.lfBuf
         for (c in 0 until 3) {
-            val cw = (gbw shr hShift[c]) * 8
-            val buf = fcoeff[c]
+            val cw = gs.outStride[c]
+            val buf = gs.out[c]!!
+            val o0 = gs.outBase[c]
             val lf = lfPlanes[c]
             val lbx0 = bx0 shr hShift[c]
             val lby0 = by0 shr vShift[c]
+            val nzRows = gs.nzRows[c]
+            // CfL で X・B には Y の係数が足されるので、Y の 0 でない行も含める
+            val nzY = if (c != 1 && maxHs == 0 && maxVs == 0) gs.nzRows[1] else nzRows
+            val bwc = gbw shr hShift[c]
             forEachVarblock(c, gbw, gbh, bx0, by0) { sx, sy, t, _ ->
                 val bwb = Tt.BW[t]
                 val bhb = Tt.BH[t]
-                val base = (sy * 8) * cw + sx * 8
+                val base = o0 + (sy * 8) * cw + sx * 8
+                val nz = maxOf(nzRows[sy * bwc + sx], nzY[sy * bwc + sx])
                 if (bwb == 1 && bhb == 1) {
                     buf[base] = lf.data[(lby0 + sy) * lf.width + lbx0 + sx]
                 } else {
@@ -932,24 +1017,20 @@ internal class FrameDecoder(
                     Tt.DCT4X8 -> Dct.dct4x8(buf, base, cw, false, gs.dct)
                     Tt.DCT8X4 -> Dct.dct4x8(buf, base, cw, true, gs.dct)
                     in Tt.AFV0..Tt.AFV3 -> Dct.afv(buf, base, cw, t - Tt.AFV0, gs.dct)
-                    else -> Dct.dct2d(buf, base, cw, bwb * 8, bhb * 8, scratch, false)
-                }
-            }
-            // 色平面へ
-            val px0 = (bx0 shr hShift[c]) * 8
-            val py0 = (by0 shr vShift[c]) * 8
-            val chh = (gbh shr vShift[c]) * 8
-            if (target != null) {
-                val stride = bw * 8
-                for (y in 0 until chh) System.arraycopy(buf, y * cw, target[c], (py0 - targetY0 + y) * stride + px0, cw)
-            } else {
-                val plane = colorPlanes!![c]
-                for (y in 0 until chh) {
-                    System.arraycopy(buf, y * cw, plane.data, (py0 + y) * plane.width + px0, cw)
+                    // HF 係数がすべて 0 の 8x8 は LF の値で埋まる
+                    Tt.DCT8 -> if (nz == 0) Dct.fill8x8(buf, base, cw) else Dct.idct8x8(buf, base, cw, nz, scratch)
+                    // 0 でない係数があるのは上から max(LF の行数, nz) 行だけ
+                    else -> Dct.idct2d(buf, base, cw, bwb * 8, bhb * 8, maxOf(bhb, nz), scratch, gs.dct.cols)
                 }
             }
         }
     }
+
+    /** X・B の量子化行列の倍率 (Y は 1) */
+    private fun qmScales(): FloatArray = floatArrayOf(
+        Math.pow(0.8, (header.xQmScale - 2).toDouble()).toFloat(), 1f,
+        Math.pow(0.8, (header.bQmScale - 2).toDouble()).toFloat(),
+    )
 
     private inline fun forEachVarblock(c: Int, gbw: Int, gbh: Int, bx0: Int, by0: Int, f: (Int, Int, Int, Int) -> Unit) {
         val hs = hShift[c]
@@ -1293,14 +1374,9 @@ internal class FrameDecoder(
         val xb = minOf(w, outW - ox)
         val gab = header.gabor
         val epf = header.epf
-        val epfSteps = when (epf?.iters) {
-            null -> IntArray(0)
-            1 -> intArrayOf(1)
-            2 -> intArrayOf(1, 2)
-            else -> intArrayOf(0, 1, 2)
-        }
-        val epfRadius = IntArray(epfSteps.size) { when (epfSteps[it]) { 0 -> 3; 1 -> 2; else -> 1 } }
-        val epfHalo = epfRadius.sum()
+        val epfSteps = Filters.epfSteps(epf)
+        var epfHalo = 0
+        for (st in epfSteps) epfHalo += Filters.epfRadius(st)
         val halo = epfHalo + (if (gab != null) 1 else 0)
         val alphaIdx = image.alphaChannel
         // 変換のある Modular 画像では、アルファは最後に逆変換してから書き込む (それまでは不透明として描く)
@@ -1324,7 +1400,7 @@ internal class FrameDecoder(
         fun idctOff(y: Int) = if (y >= curY0) (y - curY0) * stride else (y - (curY0 - carryRows)) * stride
 
         // Gaborish 後の行 (y は鏡映済みでなくてよい)
-        val inputRow: (Int, Int, FloatArray, Int) -> Unit = { c, yy, dst, off ->
+        val inputRow = Filters.RowSource { c, yy, dst, off ->
             val y = Filters.mirror(yy, h)
             val src = idctRow(c, y)
             val o = idctOff(y)
@@ -1363,94 +1439,139 @@ internal class FrameDecoder(
         val cb2 = Math.cbrt(ob[2].toDouble()).toFloat()
         val its = 255f / image.toneMapping.intensityTarget
         val m = image.opsinInverseMatrix
+        val ob0 = ob[0]
+        val ob1 = ob[1]
+        val ob2 = ob[2]
+        val m0 = m[0]
+        val m1 = m[1]
+        val m2 = m[2]
+        val m3 = m[3]
+        val m4 = m[4]
+        val m5 = m[5]
+        val m6 = m[6]
+        val m7 = m[7]
+        val m8 = m[8]
         val grey = image.colourEncoding.colourSpace == ColourSpace.GREY
         val alphaScale = alphaDepth?.scale() ?: 0f
 
-        // 帯の作業領域は ScratchPool から取り、帯ごと・フレームごとに確保し直さない
         val threads = if (executor == null) 1 else Runtime.getRuntime().availableProcessors()
         val rs = w + 6
-        val band = (BAND_PIXELS / w).coerceIn(16, 64)
 
-        fun finalizeBand(y0: Int, y1: Int, sc: Filters.EpfScratch) {
-            // 帯の行 y0..y1 の色 (XYB)。画素 (x, y) は rows[c][(y - lo) * rs + x + 3]
-            val rows: Array<FloatArray>
-            val lo: Int
-            if (epf != null) {
-                Filters.epfBand(inputRow, y0, y1, w, h, epfHalo, epfSteps, epfRadius, epf, epfSigma, bw, sc)
-                rows = sc.result
-                lo = sc.resultLo
-            } else {
-                sc.ensure((y1 - y0) * rs)
-                rows = sc.a
-                lo = y0
-                for (c in 0 until 3) for (y in y0 until y1) inputRow(c, y, rows[c], (y - y0) * rs + 3)
-            }
-            lfGlobal.patches?.let { applyPatchesToBand(it, rows, rs, lo, y0, y1, w, h) }
-            val rx = rows[0]
-            val ry = rows[1]
-            val rb = rows[2]
-            for (y in y0 until y1) {
-                val ty = y + oy
-                if (ty < 0 || ty >= outH) continue
-                val ro = (y - lo) * rs + 3
-                val oo = y * w
-                val to = ty * outW + ox
-                for (x in xa until xb) {
-                    val i = ro + x
-                    val gl = ry[i] + rx[i] - cb0
-                    val gm = ry[i] - rx[i] - cb1
-                    val gs = rb[i] - cb2
-                    val ml = (gl * gl * gl + ob[0]) * its
-                    val mm = (gm * gm * gm + ob[1]) * its
-                    val ms = (gs * gs * gs + ob[2]) * its
-                    var r = m[0] * ml + m[1] * mm + m[2] * ms
-                    var g = m[3] * ml + m[4] * mm + m[5] * ms
-                    var bb = m[6] * ml + m[7] * mm + m[8] * ms
-                    if (grey) {
-                        val l = 0.2126f * r + 0.7152f * g + 0.0722f * bb
-                        r = l; g = l; bb = l
-                    }
-                    var av = 1f
-                    if (alpha != null) {
-                        val raw = alpha.data[oo + x]
-                        av = if (alphaDepth!!.isFloat) alphaDepth.parseFloatSample(raw) else raw * alphaScale
-                        if (av < 0f) av = 0f else if (av > 1f) av = 1f
-                    }
+        // 行 ta..tb を上から順に仕上げる (EPF は行ごとに計算し、その行をすぐ ARGB にする)
+        fun finalizeRows(ta: Int, tb: Int) {
+            val ep = Filters.EpfRows.obtain()
+            try {
+                ep.begin(inputRow, w, h, epfSteps, epf, epfSigma, bw, ta)
+                val rows = Array(3) { ep.out(it) }
+                val lr = FloatArray(w)
+                val lg = FloatArray(w)
+                val lb = FloatArray(w)
+                val rx = rows[0]
+                val ry = rows[1]
+                val rb = rows[2]
+                for (y in ta until tb) {
+                    val o = ep.row(y)
+                    // パッチは行 y の帯として重ねる (帯の先頭の行 lo は、配列の中の位置 o が (y - lo) * rs になる行)
+                    lfGlobal.patches?.let { applyPatchesToBand(it, rows, rs, y - o / rs, y, y + 1, w, h) }
+                    val ty = y + oy
+                    if (ty < 0 || ty >= outH) continue
+                    val ro = o + 3
+                    val oo = y * w
+                    val to = ty * outW + ox
                     if (premul) {
-                        var sr = ColorConvert.srgbEncodeFast(r)
-                        var sg = ColorConvert.srgbEncodeFast(g)
-                        var sb = ColorConvert.srgbEncodeFast(bb)
-                        if (av > 0f) {
-                            sr /= av; sg /= av; sb /= av
+                        for (x in xa until xb) {
+                            val i = ro + x
+                            val gl = ry[i] + rx[i] - cb0
+                            val gm = ry[i] - rx[i] - cb1
+                            val gs = rb[i] - cb2
+                            val ml = (gl * gl * gl + ob[0]) * its
+                            val mm = (gm * gm * gm + ob[1]) * its
+                            val ms = (gs * gs * gs + ob[2]) * its
+                            var r = m[0] * ml + m[1] * mm + m[2] * ms
+                            var g = m[3] * ml + m[4] * mm + m[5] * ms
+                            var bb = m[6] * ml + m[7] * mm + m[8] * ms
+                            if (grey) {
+                                val l = 0.2126f * r + 0.7152f * g + 0.0722f * bb
+                                r = l; g = l; bb = l
+                            }
+                            var av = 1f
+                            if (alpha != null) {
+                                val raw = alpha.data[oo + x]
+                                av = if (alphaDepth!!.isFloat) alphaDepth.parseFloatSample(raw) else raw * alphaScale
+                                if (av < 0f) av = 0f else if (av > 1f) av = 1f
+                            }
+                            var sr = ColorConvert.srgbEncodeFast(r)
+                            var sg = ColorConvert.srgbEncodeFast(g)
+                            var sb = ColorConvert.srgbEncodeFast(bb)
+                            if (av > 0f) {
+                                sr /= av; sg /= av; sb /= av
+                            }
+                            out[to + x] = (to8(av) shl 24) or (to8(sr) shl 16) or (to8(sg) shl 8) or to8(sb)
                         }
-                        out[to + x] = (to8(av) shl 24) or (to8(sr) shl 16) or (to8(sg) shl 8) or to8(sb)
+                        continue
+                    }
+                    // XYB から線形 RGB への変換 (分岐のない計算なので自動ベクトル化が効く) と、
+                    // 8 ビットへの変換 (表を引く) を別のループにする
+                    if (grey) {
+                        for (x in xa until xb) {
+                            val i = ro + x
+                            val gl = ry[i] + rx[i] - cb0
+                            val gm = ry[i] - rx[i] - cb1
+                            val gs = rb[i] - cb2
+                            val ml = (gl * gl * gl + ob0) * its
+                            val mm = (gm * gm * gm + ob1) * its
+                            val ms = (gs * gs * gs + ob2) * its
+                            val r = m0 * ml + m1 * mm + m2 * ms
+                            val g = m3 * ml + m4 * mm + m5 * ms
+                            val bb = m6 * ml + m7 * mm + m8 * ms
+                            val l = 0.2126f * r + 0.7152f * g + 0.0722f * bb
+                            lr[x] = l
+                            lg[x] = l
+                            lb[x] = l
+                        }
                     } else {
-                        out[to + x] = (to8(av) shl 24) or (ColorConvert.linearToSrgb8(r) shl 16) or
-                            (ColorConvert.linearToSrgb8(g) shl 8) or ColorConvert.linearToSrgb8(bb)
+                        for (x in xa until xb) {
+                            val i = ro + x
+                            val gl = ry[i] + rx[i] - cb0
+                            val gm = ry[i] - rx[i] - cb1
+                            val gs = rb[i] - cb2
+                            val ml = (gl * gl * gl + ob0) * its
+                            val mm = (gm * gm * gm + ob1) * its
+                            val ms = (gs * gs * gs + ob2) * its
+                            lr[x] = m0 * ml + m1 * mm + m2 * ms
+                            lg[x] = m3 * ml + m4 * mm + m5 * ms
+                            lb[x] = m6 * ml + m7 * mm + m8 * ms
+                        }
+                    }
+                    if (alpha == null) {
+                        for (x in xa until xb) {
+                            out[to + x] = (255 shl 24) or (ColorConvert.linearToSrgb8(lr[x]) shl 16) or
+                                (ColorConvert.linearToSrgb8(lg[x]) shl 8) or ColorConvert.linearToSrgb8(lb[x])
+                        }
+                    } else {
+                        for (x in xa until xb) {
+                            val raw = alpha.data[oo + x]
+                            var av = if (alphaDepth!!.isFloat) alphaDepth.parseFloatSample(raw) else raw * alphaScale
+                            if (av < 0f) av = 0f else if (av > 1f) av = 1f
+                            out[to + x] = (to8(av) shl 24) or (ColorConvert.linearToSrgb8(lr[x]) shl 16) or
+                                (ColorConvert.linearToSrgb8(lg[x]) shl 8) or ColorConvert.linearToSrgb8(lb[x])
+                        }
                     }
                 }
+            } finally {
+                ep.recycle()
             }
         }
 
         fun finalize(a: Int, b: Int) {
             if (a >= b) return
-            // スレッドごとに連続した行をまとめて受け持ち、その中を最大 band 行の帯に分ける
+            // スレッドごとに連続した行をまとめて受け持つ (受け持ちの境目だけ EPF の重なりを計算し直す)
             val tasks = maxOf(1, minOf(threads, (b - a + 15) / 16))
             val per = (b - a + tasks - 1) / tasks
             parallelFor(executor, tasks) { k ->
-                val sc = Filters.EpfScratch.obtain()
-                try {
-                    val ta = a + k * per
-                    val tb = minOf(b, ta + per)
-                    var y0 = ta
-                    while (y0 < tb) {
-                        val y1 = minOf(tb, y0 + band)
-                        finalizeBand(y0, y1, sc)
-                        y0 = y1
-                    }
-                } finally {
-                    sc.recycle()
-                }
+                val ta = a + k * per
+                val tb = minOf(b, ta + per)
+                if (ta < tb) finalizeRows(ta, tb)
             }
         }
 
@@ -1550,12 +1671,6 @@ internal class FrameDecoder(
 
     companion object {
         val TIMING = System.getenv("JXL_TIMING") != null
-
-        /**
-         * 逐次描画で一度に仕上げる帯の画素数の目安。帯が高いほど EPF の重なりの再計算が減るが、
-         * スレッドごとの作業領域が増えるので、幅に応じて 16〜64 行にする
-         */
-        private const val BAND_PIXELS = 64 * 1024
 
         fun to8(v: Float): Int {
             val f = v * 255f + 0.5f

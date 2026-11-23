@@ -78,32 +78,36 @@ internal object Filters {
     private val KERNEL0 = intArrayOf(0, -2, -1, -1, 0, -1, 1, -1, -2, 0, -1, 0, 1, 0, 2, 0, -1, 1, 0, 1, 1, 1, 0, 2)
     private val DIST0 = intArrayOf(0, -1, 1, 0, 0, 0, -1, 0, 0, 1)
 
+    /** EPF の段階 (0〜2) が上下に読む行数 */
+    fun epfRadius(step: Int): Int = when (step) { 0 -> 3; 1 -> 2; else -> 1 }
+
+    /** EPF の反復回数から、行う段階の並び */
+    fun epfSteps(params: EpfParams?): IntArray = when (params?.iters) {
+        null -> IntArray(0)
+        1 -> intArrayOf(1)
+        2 -> intArrayOf(1, 2)
+        else -> intArrayOf(0, 1, 2)
+    }
+
     /**
-     * エッジ保存フィルタ。[sigma] は VarDCT のブロックごとの値 (行の長さ [sigmaStride])、
-     * Modular では null (sigma_for_modular を使う)。
-     * 全段階を 32 行の帯ごとにまとめて処理するので、作業領域は帯の分だけで済む。
+     * エッジ保存フィルタ (フレーム全体の平面をその場で書き換える)。[sigma] は VarDCT のブロックごとの値
+     * (行の長さ [sigmaStride])、Modular では null (sigma_for_modular を使う)。
+     * スレッドごとに連続した行 (縞) を受け持ち、[EpfRows] で上から 1 行ずつ計算して書き戻す。
      */
     fun epf(colors: Array<Plane>, params: EpfParams, sigma: FloatArray?, sigmaStride: Int, executor: ExecutorService?): Array<Plane> {
         val w = colors[0].width
         val h = colors[0].height
-        val steps = when (params.iters) {
-            1 -> intArrayOf(1)
-            2 -> intArrayOf(1, 2)
-            else -> intArrayOf(0, 1, 2)
-        }
-        val radius = IntArray(steps.size) { when (steps[it]) { 0 -> 3; 1 -> 2; else -> 1 } }
-        val halo = radius.sum()
+        val steps = epfSteps(params)
+        var halo = 0
+        for (st in steps) halo += epfRadius(st)
         val planes = Array(3) { colors[it].data }
-        val band = 32
-        // スレッドごとの縞 (帯の集まり)。縞の境目の外側の行は、書き換えられる前に退避しておく
         val threads = if (executor == null) 1 else Runtime.getRuntime().availableProcessors()
-        val numBands = (h + band - 1) / band
-        val stripes = maxOf(1, minOf(threads, numBands))
-        val bandsPerStripe = (numBands + stripes - 1) / stripes
+        val stripes = maxOf(1, minOf(threads, (h + 31) / 32))
+        val per = (h + stripes - 1) / stripes
+        // 縞の外側の行は、他の縞に書き換えられる前に退避しておく (上の halo 行と下の halo 行、画像の外は鏡映)
         val saved = Array(stripes) { s ->
-            val ys = minOf(h, s * bandsPerStripe * band)
-            val ye = minOf(h, (s + 1) * bandsPerStripe * band)
-            // 上の halo 行と下の halo 行 (画像の外は鏡映)
+            val ys = minOf(h, s * per)
+            val ye = minOf(h, (s + 1) * per)
             Array(3) { c ->
                 val buf = FloatArray(2 * halo * w)
                 for (k in 0 until halo) {
@@ -114,287 +118,371 @@ internal object Filters {
             }
         }
         parallelFor(executor, stripes) { s ->
-            val ys = minOf(h, s * bandsPerStripe * band)
-            val ye = minOf(h, (s + 1) * bandsPerStripe * band)
+            val ys = minOf(h, s * per)
+            val ye = minOf(h, (s + 1) * per)
+            if (ys >= ye) return@parallelFor
             val sv = saved[s]
-            fun inputRow(c: Int, y: Int, dst: FloatArray, off: Int) {
+            // 縞の中の行は、出力の行 y を書き戻す時点で y + halo 行目まで読み終えているので、その場で書き戻してよい
+            val src = RowSource { c, y, dst, off ->
                 if (y < ys) System.arraycopy(sv[c], (y - (ys - halo)) * w, dst, off, w)
                 else if (y >= ye) System.arraycopy(sv[c], (halo + y - ye) * w, dst, off, w)
                 else System.arraycopy(planes[c], y * w, dst, off, w)
             }
-            // 2 組の作業領域を交互に使う (前の帯の結果は、次の帯の入力を読み終えてから書き戻す)
-            var cur = EpfScratch.obtain()
-            var prev = EpfScratch.obtain()
-            var pendingY0 = 0
-            var pendingY1 = 0
-            fun writeBack(sc: EpfScratch) {
-                for (c in 0 until 3) {
-                    val src = sc.result[c]
-                    for (y in pendingY0 until pendingY1) System.arraycopy(src, (y - sc.resultLo) * (w + 6) + 3, planes[c], y * w, w)
+            val rows = EpfRows.obtain()
+            try {
+                rows.begin(src, w, h, steps, params, sigma, sigmaStride, ys)
+                for (y in ys until ye) {
+                    val o = rows.row(y) + 3
+                    for (c in 0 until 3) System.arraycopy(rows.out(c), o, planes[c], y * w, w)
                 }
+            } finally {
+                rows.recycle()
             }
-            var y0 = ys
-            while (y0 < ye) {
-                val y1 = minOf(ye, y0 + band)
-                epfBand(::inputRow, y0, y1, w, h, halo, steps, radius, params, sigma, sigmaStride, cur)
-                if (pendingY1 > pendingY0) writeBack(prev)
-                pendingY0 = y0
-                pendingY1 = y1
-                val t = prev
-                prev = cur
-                cur = t
-                y0 = y1
-            }
-            if (pendingY1 > pendingY0) writeBack(prev)
-            cur.recycle()
-            prev.recycle()
         }
         return colors
     }
 
-    /**
-     * EPF の帯の計算に使う作業領域。帯ごとに確保し直さず、同じスレッドで使い回す。
-     * 結果は [result] の 3 平面 (行の長さ w + 6、画素は列 3 から、画像の行 [resultLo] から始まる)。
-     */
-    class EpfScratch {
-        var a: Array<FloatArray> = Array(3) { FloatArray(0) }
-        var b: Array<FloatArray> = Array(3) { FloatArray(0) }
-        var hd = FloatArray(0)
-        var vd = FloatArray(0)
-        var rowA = FloatArray(0)
-        var rowB = FloatArray(0)
-        lateinit var result: Array<FloatArray>
-        var resultLo = 0
-
-        fun ensure(n: Int) {
-            if (a[0].size < n) {
-                a = Array(3) { FloatArray(n) }
-                b = Array(3) { FloatArray(n) }
-            }
-        }
-
-        fun ensureDiff(n: Int, pw: Int) {
-            if (hd.size < n) {
-                hd = FloatArray(n)
-                vd = FloatArray(n)
-            }
-            if (rowA.size < pw) {
-                rowA = FloatArray(pw)
-                rowB = FloatArray(pw)
-            }
-        }
-
-        /** 使い終わったら [ScratchPool] に返す */
-        fun recycle() {
-            ScratchPool.give(this, 4L * (6L * a[0].size + 2L * hd.size + 2L * rowA.size))
-        }
-
-        companion object {
-            /** [ScratchPool] から取り出す。無ければ新しく作る */
-            fun obtain(): EpfScratch = ScratchPool.take(EpfScratch::class.java) { true } ?: EpfScratch()
-        }
+    /** チャンネル c の行 y (画像の外でもよい) の w 画素を dst[off] から書く */
+    fun interface RowSource {
+        fun row(c: Int, y: Int, dst: FloatArray, off: Int)
     }
 
     /**
-     * 帯 (行 y0..y1) の全段階を計算する。結果は [EpfScratch.result] (行の長さ w + 6) に入る:
-     * 画素 (x, y) は result[c][(y - resultLo) * (w + 6) + x + 3]
+     * EPF を行ごとに上から順に計算する。入力と各段階の結果は数行の環状バッファにだけ持つので、
+     * 帯に分けて重なり (halo) を計算し直すことがなく、作業領域も幅 × 数十行で済む。
+     * 1 つのスレッドが連続した行を受け持つ ([begin] の行から順に [row] を呼ぶ)。
+     *
+     * 各段階の行 y は配列の (y and mask) * (w + 6) から始まり、画素 x は +3+x (左右 3 画素は鏡映)。
+     * 画像の外の行は、入力では [RowSource] が、EPF の段階では計算した行を鏡映して返す。
      */
-    fun epfBand(
-        inputRow: (Int, Int, FloatArray, Int) -> Unit,
-        y0: Int, y1: Int, w: Int, h: Int, halo: Int, steps: IntArray, radius: IntArray,
-        params: EpfParams, sigma: FloatArray?, sigmaStride: Int, scratch: EpfScratch,
-    ) {
-        val pw = w + 6
-        var lo = y0 - halo
-        var hi = y1 + halo
-        scratch.ensure((hi - lo) * pw)
-        var cur = scratch.a
-        var next = scratch.b
-        for (c in 0 until 3) {
-            for (y in lo until hi) {
-                val row = (y - lo) * pw
-                inputRow(c, y, cur[c], row + 3)
-                padRow(cur[c], row, w)
-            }
-        }
-        for ((k, step) in steps.withIndex()) {
-            val r = radius[k]
-            val nlo = lo + r
-            val nhi = hi - r
-            val ya = maxOf(nlo, 0)
-            val yb = minOf(nhi, h)
-            if (step == 0) epfStep0(cur, lo, next, nlo, ya, yb, w, params, sigma, sigmaStride)
-            else epfStep12(cur, lo, hi - lo, next, nlo, ya, yb, w, params, sigma, sigmaStride, step, scratch)
-            // 画像の外の行は、計算した行を鏡映して埋める
-            for (y in nlo until nhi) {
-                if (y in ya until yb) continue
-                val sy = mirror(y, h)
-                for (c in 0 until 3) System.arraycopy(next[c], (sy - nlo) * pw, next[c], (y - nlo) * pw, pw)
-            }
-            val t = cur
-            cur = next
-            next = t
-            lo = nlo
-            hi = nhi
-        }
-        scratch.result = cur
-        scratch.resultLo = lo
-    }
+    class EpfRows {
+        private class Stage {
+            /** -1 は入力、0〜2 は EPF の段階 */
+            var step = -1
+            var mask = 0
+            var rows: Array<FloatArray> = Array(3) { FloatArray(0) }
+            /** 次に計算する行 */
+            var next = 0
 
-    /** 行の左右 3 画素を鏡映で埋める (row は行の先頭、画素は row+3 から) */
-    private fun padRow(buf: FloatArray, row: Int, w: Int) {
-        for (k in 0 until 3) {
-            buf[row + 2 - k] = buf[row + 3 + mirror(-1 - k, w)]
-            buf[row + 3 + w + k] = buf[row + 3 + mirror(w + k, w)]
-        }
-    }
+            // 段階 1・2: 右 (hd)・下 (vd) の画素との重み付き差分 (4 行の環状)
+            var hd = FloatArray(0)
+            var vd = FloatArray(0)
+            var rawNext = 0
 
-    private const val EPF_C0 = 6.6f * (0.70710677f - 1f)
+            // 段階 1: 差分の十字 (5 点) の和。hc は今の行だけ、vc は 4 行の環状
+            var hc = FloatArray(0)
+            var vc = FloatArray(0)
+            var vcNext = 0
 
-    /**
-     * 十字 (4 近傍) のカーネルの段階 1・2。画像の行 ya..yb を計算する。
-     * inp は画像の行 inLo から、out は行 outLo から始まる帯 (行の長さ w + 6)。
-     * 隣の画素との重み付き差分 H (右)・V (下) を先に求め、距離はその和で表す。
-     */
-    private fun epfStep12(
-        inp: Array<FloatArray>, inLo: Int, inRows: Int, out: Array<FloatArray>, outLo: Int, ya: Int, yb: Int, w: Int,
-        params: EpfParams, sigma: FloatArray?, sigmaStride: Int, step: Int, scratch: EpfScratch,
-    ) {
-        val pw = w + 6
-        val stepMul = if (step == 2) params.pass2SigmaScale else 1f
-        val border = params.borderSadMul
-        val s0 = params.channelScale[0]
-        val s1 = params.channelScale[1]
-        val s2 = params.channelScale[2]
-        val i0 = inp[0]
-        val i1 = inp[1]
-        val i2 = inp[2]
-        val o0 = out[0]
-        val o1 = out[1]
-        val o2 = out[2]
-        val plus = step == 1
-        // 差分は画像の行 ya-2 .. yb+1 について計算する (局所行 0 = ya-2)
-        val rows = (yb - ya) + 4
-        scratch.ensureDiff(rows * pw, pw)
-        val hd = scratch.hd
-        val vd = scratch.vd
-        for (r in 0 until rows) {
-            val iy = ya - 2 + r - inLo
-            if (iy < 0 || iy >= inRows) continue
-            val base = iy * pw
-            val lb = r * pw
-            for (x in 0 until pw - 1) {
-                val i = base + x
-                hd[lb + x] = s0 * kotlin.math.abs(i0[i + 1] - i0[i]) + s1 * kotlin.math.abs(i1[i + 1] - i1[i]) +
-                    s2 * kotlin.math.abs(i2[i + 1] - i2[i])
+            fun ensure(pw: Int) {
+                val n = (mask + 1) * pw
+                if (rows[0].size < n) rows = Array(3) { FloatArray(n) }
+                if (step == 1 || step == 2) {
+                    if (hd.size < 4 * pw) {
+                        hd = FloatArray(4 * pw)
+                        vd = FloatArray(4 * pw)
+                    }
+                }
+                if (step == 1) {
+                    if (hc.size < pw) hc = FloatArray(pw)
+                    if (vc.size < 4 * pw) vc = FloatArray(4 * pw)
+                }
             }
-            if (iy + 1 < inRows) {
-                for (x in 0 until pw) {
-                    val i = base + x
-                    vd[lb + x] = s0 * kotlin.math.abs(i0[i + pw] - i0[i]) + s1 * kotlin.math.abs(i1[i + pw] - i1[i]) +
-                        s2 * kotlin.math.abs(i2[i + pw] - i2[i])
+
+            fun bytes(): Long = 4L * (3L * rows[0].size + hd.size + vd.size + hc.size + vc.size)
+        }
+
+        private val stages = Array(4) { Stage() }
+        private var n = 1
+        private var w = 0
+        private var h = 0
+        private var pw = 0
+        private var src: RowSource? = null
+        private var params: EpfParams? = null
+        private var sigma: FloatArray? = null
+        private var sigmaStride = 0
+        private var nis = FloatArray(0)
+        private val tapK = IntArray(12)
+        private val tapA = IntArray(60)
+        private val tapB = IntArray(60)
+
+        /**
+         * 行 [y0] から計算を始める。[steps] は EPF の段階の並び (空なら入力をそのまま返す)
+         */
+        fun begin(
+            src: RowSource, w: Int, h: Int, steps: IntArray, params: EpfParams?, sigma: FloatArray?, sigmaStride: Int, y0: Int,
+        ) {
+            this.src = src
+            this.w = w
+            this.h = h
+            this.params = params
+            this.sigma = sigma
+            this.sigmaStride = sigmaStride
+            pw = w + 6
+            if (nis.size < w) nis = FloatArray(w)
+            n = steps.size + 1
+            var start = y0
+            for (k in n - 1 downTo 0) {
+                val st = stages[k]
+                st.step = if (k == 0) -1 else steps[k - 1]
+                // 次の段階が上下に読む行数ぶんを残す (最後の段階は計算した行をすぐ使うので 1 行)
+                st.mask = if (k == n - 1) 0 else if (epfRadius(steps[k]) == 1) 3 else 7
+                st.ensure(pw)
+                st.next = start
+                st.rawNext = if (st.step == 1) start - 2 else start - 1
+                st.vcNext = start - 1
+                if (k > 0) {
+                    start -= epfRadius(st.step)
+                    // EPF の段階は画像の中の行だけ計算する (外の行は鏡映)
+                    if (k > 1) start = maxOf(start, 0)
                 }
             }
         }
-        val sh = hd
-        val sv = vd
-        if (plus) {
-            // 段階 1 は差分の 5 点 (十字) の和を使う。上の行から順にその場で書き換える
-            // (上の行の元の値は rowA・rowB に退避する)
-            sumCross(hd, rows, pw, scratch)
-            sumCross(vd, rows, pw, scratch)
+
+        /** 最後の段階の配列 (チャンネル c) */
+        fun out(c: Int): FloatArray = stages[n - 1].rows[c]
+
+        /** 最後の段階の行 y (0 <= y < h) を計算し、[out] の中の行の先頭の位置を返す */
+        fun row(y: Int): Int = ensure(n - 1, y)
+
+        private fun ensure(k: Int, y: Int): Int {
+            val st = stages[k]
+            val yy = if (k == 0) y else mirror(y, h)
+            while (st.next <= yy) {
+                produce(k, st.next)
+                st.next++
+            }
+            return (yy and st.mask) * pw
         }
-        for (y in ya until yb) {
-            val yBorder = ((y + 1) and 6) == 0
-            val lrow = (y - ya + 2) * pw
-            val prow = (y - inLo) * pw
-            val orow = (y - outLo) * pw
+
+        private fun produce(k: Int, y: Int) {
+            val st = stages[k]
+            val o = (y and st.mask) * pw
+            if (k == 0) {
+                val s = src!!
+                for (c in 0 until 3) {
+                    s.row(c, y, st.rows[c], o + 3)
+                    padRow(st.rows[c], o, w)
+                }
+                return
+            }
+            if (st.step == 0) step0(k, y, o) else step12(k, y, o)
+            for (c in 0 until 3) padRow(st.rows[c], o, w)
+        }
+
+        /** 段階 k の差分の行 r (前の段階の行 r と r+1 から) */
+        private fun rawDiff(k: Int, r: Int) {
+            val st = stages[k]
+            val pv = stages[k - 1]
+            val a = ensure(k - 1, r)
+            val b = ensure(k - 1, r + 1)
+            val p = params!!
+            val s0 = p.channelScale[0]
+            val s1 = p.channelScale[1]
+            val s2 = p.channelScale[2]
+            val p0 = pv.rows[0]
+            val p1 = pv.rows[1]
+            val p2 = pv.rows[2]
+            val hd = st.hd
+            val vd = st.vd
+            val lb = (r and 3) * pw
+            // 使う列だけ: 段階 1 は十字の和のために左右 1 列多く要る
+            val plus = st.step == 1
+            val h0 = if (plus) 1 else 2
+            val h1 = if (plus) w + 4 else w + 3
+            // この行の差分を使うのは、出力の行 r-1 .. r+2 の平滑化するブロック (の左 2・右 1 画素まで) だけ
+            forActiveRuns(r - 1, r + 2) { xs, xe ->
+                val x0 = maxOf(h0, xs + 1)
+                val x1 = minOf(h1, xe + 4)
+                for (x in x0 until x1) {
+                    hd[lb + x] = s0 * kotlin.math.abs(p0[a + x + 1] - p0[a + x]) + s1 * kotlin.math.abs(p1[a + x + 1] - p1[a + x]) +
+                        s2 * kotlin.math.abs(p2[a + x + 1] - p2[a + x])
+                }
+                for (x in maxOf(h0 + 1, x0) until x1) {
+                    vd[lb + x] = s0 * kotlin.math.abs(p0[b + x] - p0[a + x]) + s1 * kotlin.math.abs(p1[b + x] - p1[a + x]) +
+                        s2 * kotlin.math.abs(p2[b + x] - p2[a + x])
+                }
+            }
+        }
+
+        /** ブロック行 br・ブロック列 bx を平滑化するか (sigma が小さいブロックはそのまま写す) */
+        private fun blockActive(br: Int, bx: Int): Boolean {
+            val sig = sigma
+            val s = if (sig != null) sig[br * sigmaStride + bx] else params!!.sigmaForModular
+            return !(s < 0.3f)
+        }
+
+        /**
+         * 出力の行 ya..yb のどれかで平滑化するブロックが続く列の範囲 [xs, xe) (画素) ごとに f を呼ぶ。
+         * 画像の外の行は含めない
+         */
+        private inline fun forActiveRuns(ya: Int, yb: Int, f: (Int, Int) -> Unit) {
+            val br0 = maxOf(0, ya) shr 3
+            val br1 = (minOf(h - 1, yb)) shr 3
+            if (br1 < br0) return
+            val nb = (w + 7) shr 3
             var bx = 0
-            while (bx < w) {
-                val s = if (sigma != null) sigma[(y shr 3) * sigmaStride + (bx shr 3)] else params.sigmaForModular
-                val xEnd = minOf(w, bx + 8)
-                if (s < 0.3f) {
-                    System.arraycopy(i0, prow + bx + 3, o0, orow + bx + 3, xEnd - bx)
-                    System.arraycopy(i1, prow + bx + 3, o1, orow + bx + 3, xEnd - bx)
-                    System.arraycopy(i2, prow + bx + 3, o2, orow + bx + 3, xEnd - bx)
-                    bx = xEnd
+            while (bx < nb) {
+                if (!blockActive(br0, bx) && (br1 == br0 || !blockActive(br1, bx))) {
+                    bx++
                     continue
                 }
-                val nisBorder = EPF_C0 / s * stepMul * border
-                val nisInner = if (yBorder) nisBorder else EPF_C0 / s * stepMul
-                for (x in bx until xEnd) {
-                    val pi = prow + x + 3
-                    val xb = x and 7
-                    val nis = if (xb == 0 || xb == 7) nisBorder else nisInner
-                    val li = lrow + x + 3
-                    var wr = 1f + sh[li] * nis
-                    if (wr < 0f) wr = 0f
-                    var wl = 1f + sh[li - 1] * nis
-                    if (wl < 0f) wl = 0f
-                    var wd = 1f + sv[li] * nis
-                    if (wd < 0f) wd = 0f
-                    var wu = 1f + sv[li - pw] * nis
-                    if (wu < 0f) wu = 0f
-                    val inv = 1f / (1f + wr + wl + wd + wu)
-                    val oi = orow + x + 3
-                    o0[oi] = (i0[pi] + wr * i0[pi + 1] + wl * i0[pi - 1] + wd * i0[pi + pw] + wu * i0[pi - pw]) * inv
-                    o1[oi] = (i1[pi] + wr * i1[pi + 1] + wl * i1[pi - 1] + wd * i1[pi + pw] + wu * i1[pi - pw]) * inv
-                    o2[oi] = (i2[pi] + wr * i2[pi + 1] + wl * i2[pi - 1] + wd * i2[pi + pw] + wu * i2[pi - pw]) * inv
+                val bs = bx
+                bx++
+                while (bx < nb && (blockActive(br0, bx) || (br1 != br0 && blockActive(br1, bx)))) bx++
+                f(bs * 8, minOf(w, bx * 8))
+            }
+        }
+
+        /**
+         * 十字 (4 近傍) のカーネルの段階 1・2。隣の画素との重み付き差分 H (右)・V (下) を先に求め、
+         * 段階 1 の距離はその十字の和、段階 2 は差分そのもの
+         */
+        private fun step12(k: Int, y: Int, o: Int) {
+            val st = stages[k]
+            val pv = stages[k - 1]
+            val p = params!!
+            val plus = st.step == 1
+            val rawTo = if (plus) y + 1 else y
+            while (st.rawNext <= rawTo) {
+                rawDiff(k, st.rawNext)
+                st.rawNext++
+            }
+            val sh: FloatArray
+            val sho: Int
+            val sv: FloatArray
+            if (plus) {
+                val d = st.hd
+                val c = (y and 3) * pw
+                val u = ((y - 1) and 3) * pw
+                val dn = ((y + 1) and 3) * pw
+                val hc = st.hc
+                // 十字の和も、平滑化する画素が使う列だけ (hc は左 1 画素まで、vc はその行と次の行で使う)
+                forActiveRuns(y, y) { xs, xe ->
+                    for (x in maxOf(2, xs + 2) until minOf(w + 3, xe + 3)) {
+                        hc[x] = d[c + x] + d[u + x] + d[dn + x] + d[c + x - 1] + d[c + x + 1]
+                    }
                 }
-                bx = xEnd
+                while (st.vcNext <= y) {
+                    val r = st.vcNext
+                    val v = st.vd
+                    val vc = st.vc
+                    val vr = (r and 3) * pw
+                    val vu = ((r - 1) and 3) * pw
+                    val vn = ((r + 1) and 3) * pw
+                    forActiveRuns(r, r + 1) { xs, xe ->
+                        for (x in maxOf(3, xs + 3) until minOf(w + 3, xe + 3)) {
+                            vc[vr + x] = v[vr + x] + v[vu + x] + v[vn + x] + v[vr + x - 1] + v[vr + x + 1]
+                        }
+                    }
+                    st.vcNext++
+                }
+                sh = hc
+                sho = 0
+                sv = st.vc
+            } else {
+                sh = st.hd
+                sho = (y and 3) * pw
+                sv = st.vd
             }
-            for (c in 0 until 3) padRow(out[c], orow, w)
-        }
-    }
-
-    /** d の行 1..rows-2、列 1..pw-3 を、元の値の 5 点 (自分・上下左右) の和で置き換える */
-    private fun sumCross(d: FloatArray, rows: Int, pw: Int, scratch: EpfScratch) {
-        var prev = scratch.rowA
-        var cur = scratch.rowB
-        System.arraycopy(d, 0, prev, 0, pw)
-        for (r in 1 until rows - 1) {
-            val lb = r * pw
-            System.arraycopy(d, lb, cur, 0, pw)
-            for (x in 1 until pw - 2) {
-                d[lb + x] = cur[x] + prev[x] + d[lb + pw + x] + cur[x - 1] + cur[x + 1]
-            }
-            val t = prev
-            prev = cur
-            cur = t
-        }
-    }
-
-    /** 12 近傍のカーネルの段階 0 (iters = 3 のときだけ使う) */
-    private fun epfStep0(
-        inp: Array<FloatArray>, inLo: Int, out: Array<FloatArray>, outLo: Int, ya: Int, yb: Int, w: Int,
-        params: EpfParams, sigma: FloatArray?, sigmaStride: Int,
-    ) {
-        val pw = w + 6
-        val kernel = KERNEL0
-        val dist = DIST0
-        val stepMul = params.pass0SigmaScale
-        val border = params.borderSadMul
-        val scale0 = params.channelScale[0]
-        val scale1 = params.channelScale[1]
-        val scale2 = params.channelScale[2]
-        val nk = kernel.size / 2
-        val nd = dist.size / 2
-        val kOff = IntArray(nk) { kernel[2 * it + 1] * pw + kernel[2 * it] }
-        val dOff = IntArray(nd) { dist[2 * it + 1] * pw + dist[2 * it] }
-        val i0 = inp[0]
-        val i1 = inp[1]
-        val i2 = inp[2]
-        val o0 = out[0]
-        val o1 = out[1]
-        val o2 = out[2]
-        for (y in ya until yb) {
+            val svo = (y and 3) * pw
+            val svu = ((y - 1) and 3) * pw
+            val pm = ensure(k - 1, y)
+            val pu = ensure(k - 1, y - 1)
+            val pd = ensure(k - 1, y + 1)
+            val stepMul = if (st.step == 2) p.pass2SigmaScale else 1f
+            val border = p.borderSadMul
+            val i0 = pv.rows[0]
+            val i1 = pv.rows[1]
+            val i2 = pv.rows[2]
+            val o0 = st.rows[0]
+            val o1 = st.rows[1]
+            val o2 = st.rows[2]
+            val sig = sigma
+            val sRow = (y shr 3) * sigmaStride
             val yBorder = ((y + 1) and 6) == 0
-            val prow = (y - inLo) * pw
-            val orow = (y - outLo) * pw
+            val nisRow = nis
+            var bx = 0
+            while (bx < w) {
+                // 平滑化するブロックが続く範囲 [bx, runEnd) の距離の倍率を画素ごとに求めてから、まとめて計算する
+                var runEnd = bx
+                while (runEnd < w) {
+                    val s = if (sig != null) sig[sRow + (runEnd shr 3)] else p.sigmaForModular
+                    if (s < 0.3f) break
+                    val xEnd = minOf(w, runEnd + 8)
+                    val nisBorder = EPF_C0 / s * stepMul * border
+                    val nisInner = if (yBorder) nisBorder else EPF_C0 / s * stepMul
+                    nisRow[runEnd] = nisBorder
+                    for (x in runEnd + 1 until xEnd) nisRow[x] = nisInner
+                    if (xEnd - runEnd == 8) nisRow[runEnd + 7] = nisBorder
+                    runEnd = xEnd
+                }
+                for (x in bx until runEnd) {
+                    val ni = nisRow[x]
+                    val li = x + 3
+                    val wr = maxOf(0f, 1f + sh[sho + li] * ni)
+                    val wl = maxOf(0f, 1f + sh[sho + li - 1] * ni)
+                    val wd = maxOf(0f, 1f + sv[svo + li] * ni)
+                    val wu = maxOf(0f, 1f + sv[svu + li] * ni)
+                    val inv = 1f / (1f + wr + wl + wd + wu)
+                    val oi = o + li
+                    o0[oi] = (i0[pm + li] + wr * i0[pm + li + 1] + wl * i0[pm + li - 1] + wd * i0[pd + li] + wu * i0[pu + li]) * inv
+                    o1[oi] = (i1[pm + li] + wr * i1[pm + li + 1] + wl * i1[pm + li - 1] + wd * i1[pd + li] + wu * i1[pu + li]) * inv
+                    o2[oi] = (i2[pm + li] + wr * i2[pm + li + 1] + wl * i2[pm + li - 1] + wd * i2[pd + li] + wu * i2[pu + li]) * inv
+                }
+                // 平滑化しないブロック (sigma が小さい) はそのまま写す
+                bx = runEnd
+                while (bx < w) {
+                    val s = if (sig != null) sig[sRow + (bx shr 3)] else p.sigmaForModular
+                    if (!(s < 0.3f)) break
+                    val xEnd = minOf(w, bx + 8)
+                    System.arraycopy(i0, pm + bx + 3, o0, o + bx + 3, xEnd - bx)
+                    System.arraycopy(i1, pm + bx + 3, o1, o + bx + 3, xEnd - bx)
+                    System.arraycopy(i2, pm + bx + 3, o2, o + bx + 3, xEnd - bx)
+                    bx = xEnd
+                }
+            }
+        }
+
+        /** 12 近傍のカーネルの段階 0 (iters = 3 のときだけ使う) */
+        private fun step0(k: Int, y: Int, o: Int) {
+            val st = stages[k]
+            val pv = stages[k - 1]
+            val p = params!!
+            // 前の段階の行 y-3 .. y+3 の位置から、カーネルの各点と距離の各点の位置を求める
+            val rowOff = IntArray(7) { ensure(k - 1, y - 3 + it) }
+            val nk = KERNEL0.size / 2
+            val nd = DIST0.size / 2
+            for (t in 0 until nk) {
+                val kx = KERNEL0[2 * t]
+                val ky = KERNEL0[2 * t + 1]
+                tapK[t] = rowOff[ky + 3] + kx
+                for (d in 0 until nd) {
+                    val dx = DIST0[2 * d]
+                    val dy = DIST0[2 * d + 1]
+                    tapA[t * nd + d] = rowOff[ky + dy + 3] + kx + dx
+                    tapB[t * nd + d] = rowOff[dy + 3] + dx
+                }
+            }
+            val pm = rowOff[3]
+            val stepMul = p.pass0SigmaScale
+            val border = p.borderSadMul
+            val scale0 = p.channelScale[0]
+            val scale1 = p.channelScale[1]
+            val scale2 = p.channelScale[2]
+            val i0 = pv.rows[0]
+            val i1 = pv.rows[1]
+            val i2 = pv.rows[2]
+            val o0 = st.rows[0]
+            val o1 = st.rows[1]
+            val o2 = st.rows[2]
+            val sig = sigma
+            val yBorder = ((y + 1) and 6) == 0
             for (x in 0 until w) {
-                val s = if (sigma != null) sigma[(y shr 3) * sigmaStride + (x shr 3)] else params.sigmaForModular
-                val pi = prow + x + 3
-                val oi = orow + x + 3
+                val s = if (sig != null) sig[(y shr 3) * sigmaStride + (x shr 3)] else p.sigmaForModular
+                val li = x + 3
+                val pi = pm + li
+                val oi = o + li
                 if (s < 0.3f) {
                     o0[oi] = i0[pi]
                     o1[oi] = i1[pi]
@@ -408,16 +496,17 @@ internal object Filters {
                 var s0 = i0[pi]
                 var s1 = i1[pi]
                 var s2 = i2[pi]
-                for (k in 0 until nk) {
-                    val ki = pi + kOff[k]
+                for (t in 0 until nk) {
+                    val ki = tapK[t] + li
                     var a0 = 0f
                     var a1 = 0f
                     var a2 = 0f
                     for (d in 0 until nd) {
-                        val od = dOff[d]
-                        a0 += kotlin.math.abs(i0[ki + od] - i0[pi + od])
-                        a1 += kotlin.math.abs(i1[ki + od] - i1[pi + od])
-                        a2 += kotlin.math.abs(i2[ki + od] - i2[pi + od])
+                        val ia = tapA[t * nd + d] + li
+                        val ib = tapB[t * nd + d] + li
+                        a0 += kotlin.math.abs(i0[ia] - i0[ib])
+                        a1 += kotlin.math.abs(i1[ia] - i1[ib])
+                        a2 += kotlin.math.abs(i2[ia] - i2[ib])
                     }
                     val dd = scale0 * a0 + scale1 * a1 + scale2 * a2
                     var wt = 1f + dd * negInvSigma
@@ -432,9 +521,32 @@ internal object Filters {
                 o1[oi] = s1 * inv
                 o2[oi] = s2 * inv
             }
-            for (c in 0 until 3) padRow(out[c], orow, w)
+        }
+
+        /** 使い終わったら [ScratchPool] に返す */
+        fun recycle() {
+            src = null
+            sigma = null
+            var bytes = 1024L
+            for (st in stages) bytes += st.bytes()
+            ScratchPool.give(this, bytes)
+        }
+
+        companion object {
+            /** [ScratchPool] から取り出す。無ければ新しく作る */
+            fun obtain(): EpfRows = ScratchPool.take(EpfRows::class.java) { true } ?: EpfRows()
         }
     }
+
+    /** 行の左右 3 画素を鏡映で埋める (row は行の先頭、画素は row+3 から) */
+    private fun padRow(buf: FloatArray, row: Int, w: Int) {
+        for (k in 0 until 3) {
+            buf[row + 2 - k] = buf[row + 3 + mirror(-1 - k, w)]
+            buf[row + 3 + w + k] = buf[row + 3 + mirror(w + k, w)]
+        }
+    }
+
+    private const val EPF_C0 = 6.6f * (0.70710677f - 1f)
 
     /** 非分離型アップサンプリング (2^shift 倍)。出力は outW x outH に切り詰める */
     fun upsample(src: Plane, shift: Int, image: ImageHeader, outW: Int, outH: Int): Plane {
