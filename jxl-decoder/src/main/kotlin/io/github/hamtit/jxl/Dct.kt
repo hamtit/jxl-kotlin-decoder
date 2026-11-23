@@ -200,7 +200,7 @@ internal object Dct {
     fun dct2d(buf: FloatArray, base: Int, stride: Int, w: Int, h: Int, scratch: FloatArray, forward: Boolean) {
         if (w * h <= 1) return
         if (!forward && w == 8 && h == 8 && scratch.size >= 128) {
-            idct8x8(buf, base, stride, scratch)
+            idct8x8(buf, base, stride, 8, scratch)
             return
         }
         // 行方向
@@ -272,19 +272,50 @@ internal object Dct {
         }
     }
 
-    /** 8x8 の逆 DCT。行を変換して転置し、もう一度行を変換して転置して戻す */
-    private fun idct8x8(buf: FloatArray, base: Int, stride: Int, t: FloatArray) {
-        for (y in 0 until 8) {
+    /**
+     * 8x8 の逆 DCT。行を変換して転置し、もう一度行を変換して転置して戻す。
+     * 0 でない係数があるのは上から [rows] 行だけ (残りの行は変換しても 0 なので飛ばす)。t は 128 要素以上
+     */
+    fun idct8x8(buf: FloatArray, base: Int, stride: Int, rows: Int, t: FloatArray) {
+        for (y in 0 until rows) {
             val o = base + y * stride
             val r = y * 8
             for (x in 0 until 8) t[r + x] = buf[o + x]
             idct8(t, r)
         }
-        for (y in 0 until 8) for (x in 0 until 8) t[64 + x * 8 + y] = t[y * 8 + x]
-        for (x in 0 until 8) idct8(t, 64 + x * 8)
+        for (y in 0 until rows) for (x in 0 until 8) t[64 + x * 8 + y] = t[y * 8 + x]
+        for (x in 0 until 8) {
+            for (y in rows until 8) t[64 + x * 8 + y] = 0f
+            idct8(t, 64 + x * 8)
+        }
         for (y in 0 until 8) {
             val o = base + y * stride
             for (x in 0 until 8) buf[o + x] = t[64 + x * 8 + y]
+        }
+    }
+
+    /** 直流成分だけの 8x8 の逆 DCT (全画素が buf[base] になる) */
+    fun fill8x8(buf: FloatArray, base: Int, stride: Int) {
+        val v = buf[base]
+        for (y in 0 until 8) buf.fill(v, base + y * stride, base + y * stride + 8)
+    }
+
+    /**
+     * 幅 w・高さ h (8 以上) の逆 DCT。0 でない係数があるのは上から [rows] 行だけで、
+     * 残りの行は行方向の変換をしても 0 なので飛ばす。scratch は 2 * max(w, h) 以上
+     */
+    fun idct2d(buf: FloatArray, base: Int, stride: Int, w: Int, h: Int, rows: Int, scratch: FloatArray) {
+        if (w == 8 && h == 8) {
+            idct8x8(buf, base, stride, rows, scratch)
+            return
+        }
+        for (y in 0 until rows) dctInPlace(buf, base + y * stride, w, scratch, 0, false)
+        val col = scratch
+        for (x in 0 until w) {
+            for (y in 0 until rows) col[y] = buf[base + y * stride + x]
+            col.fill(0f, rows, h)
+            dctInPlace(col, 0, h, col, h, false)
+            for (y in 0 until h) buf[base + y * stride + x] = col[y]
         }
     }
 

@@ -663,6 +663,7 @@ internal class FrameDecoder(
                 val n = ((gbw shr hShift[c]) * 8) * ((gbh shr vShift[c]) * 8)
                 gs.coeffs[c].fill(0f, 0, n)
                 gs.intCoeffs?.get(c)?.fill(0, 0, n)
+                gs.nzRows[c].fill(0, 0, n / 64)
             }
         }
         try {
@@ -700,6 +701,11 @@ internal class FrameDecoder(
     private class GroupScratch(size: Int, multiPass: Boolean) {
         val coeffs = Array(3) { FloatArray(size) }
         val intCoeffs: Array<IntArray>? = if (multiPass) Array(3) { IntArray(size) } else null
+        /**
+         * ブロック (チャンネルごと、グループ内のブロック座標 y * 幅 + x) の HF 係数のうち 0 でないものがある行の数
+         * (係数の配置での上からの行数。0 なら HF 係数はすべて 0)。逆 DCT で 0 だけの行を飛ばすのに使う
+         */
+        val nzRows = Array(3) { IntArray(maxOf(1, size / 64)) }
         val scratch = FloatArray(512)
         val tmp = FloatArray(64)
         val lfBuf = FloatArray(32 * 32)
@@ -719,7 +725,14 @@ internal class FrameDecoder(
     private fun decodeHfCoefficients(br: BitReader, pass: Int, gx: Int, gy: Int, gbw: Int, gbh: Int, gs: GroupScratch) {
         val outF = gs.coeffs
         val outI = gs.intCoeffs
+        val nzRows = gs.nzRows
         val ctx = lfGlobal.blockCtx!!
+        // パスが 1 つなら、係数を読んだその場で逆量子化する (reconstructGroup で全係数を見直さない)
+        val qm = quantMatrices!!
+        val qmScale = qmScales()
+        val qb = image.quantBias
+        val qbn = image.quantBiasNumerator
+        val globalScale = lfGlobal.globalScale.toFloat()
         val hfPass = hfPasses[pass]
         val shift = if (pass < header.passes.shift.size) header.passes.shift[pass] else 0
         val hfpBits = addLog2Ceil(numHfPresets - 1)
@@ -804,6 +817,11 @@ internal class FrameDecoder(
                     val transpose = Tt.needTranspose(t)
                     val coeffBase = ctxBase + blockCtx * 458 + 37 * ctx.numClusters
                     val size = order.size
+                    val m = qm.get(t, c)
+                    val bwv = w8 * 8
+                    val scale = 65536f / (globalScale * qf) * qmScale[c]
+                    val qbc = qb[c]
+                    var rows = 0
                     var k = numBlocks
                     while (k < size) {
                         val i = k - numBlocks
@@ -824,13 +842,23 @@ internal class FrameDecoder(
                             val tmp = dx; dx = dy; dy = tmp
                         }
                         val ci = (sy * 8 + dy) * cw + sx * 8 + dx
-                        if (coeffI != null) coeffI[ci] += v else coeffF[ci] = v.toFloat()
+                        if (coeffI != null) {
+                            coeffI[ci] += v
+                        } else {
+                            // 各係数は一度だけ書かれるので、整数のまま足し合わせてから逆量子化するのと同じ値になる
+                            val q = v.toFloat()
+                            val dq = if (q == 1f || q == -1f) q * qbc else q - qbn / q
+                            coeffF[ci] = dq * m[dy * bwv + dx] * scale
+                        }
+                        if (dy >= rows) rows = dy + 1
                         prevNz = 1
                         nonZeros--
                         if (nonZeros == 0) break
                         k++
                     }
                     if (nonZeros != 0) fail("too many zeros in varblock")
+                    val bi = sy * (gbw shr hs) + sx
+                    if (rows > nzRows[c][bi]) nzRows[c][bi] = rows
                 }
             }
         }
@@ -845,14 +873,12 @@ internal class FrameDecoder(
         val qm = quantMatrices!!
         val bx0 = gx * (gd / 8)
         val by0 = gy * (gd / 8)
-        val qmScale = floatArrayOf(
-            Math.pow(0.8, (header.xQmScale - 2).toDouble()).toFloat(), 1f,
-            Math.pow(0.8, (header.bQmScale - 2).toDouble()).toFloat(),
-        )
+        val qmScale = qmScales()
         val fcoeff = coeffs
         val qb = image.quantBias
         val qbn = image.quantBiasNumerator
-        for (c in 0 until 3) {
+        // パスが 1 つなら係数は読んだときに逆量子化してある
+        if (gs.intCoeffs != null) for (c in 0 until 3) {
             val cw = (gbw shr hShift[c]) * 8
             val dst = coeffs[c]
             forEachVarblock(c, gbw, gbh, bx0, by0) { sx, sy, t, mul ->
@@ -908,10 +934,15 @@ internal class FrameDecoder(
             val lf = lfPlanes[c]
             val lbx0 = bx0 shr hShift[c]
             val lby0 = by0 shr vShift[c]
+            val nzRows = gs.nzRows[c]
+            // CfL で X・B には Y の係数が足されるので、Y の 0 でない行も含める
+            val nzY = if (c != 1 && maxHs == 0 && maxVs == 0) gs.nzRows[1] else nzRows
+            val bwc = gbw shr hShift[c]
             forEachVarblock(c, gbw, gbh, bx0, by0) { sx, sy, t, _ ->
                 val bwb = Tt.BW[t]
                 val bhb = Tt.BH[t]
                 val base = (sy * 8) * cw + sx * 8
+                val nz = maxOf(nzRows[sy * bwc + sx], nzY[sy * bwc + sx])
                 if (bwb == 1 && bhb == 1) {
                     buf[base] = lf.data[(lby0 + sy) * lf.width + lbx0 + sx]
                 } else {
@@ -932,7 +963,10 @@ internal class FrameDecoder(
                     Tt.DCT4X8 -> Dct.dct4x8(buf, base, cw, false, gs.dct)
                     Tt.DCT8X4 -> Dct.dct4x8(buf, base, cw, true, gs.dct)
                     in Tt.AFV0..Tt.AFV3 -> Dct.afv(buf, base, cw, t - Tt.AFV0, gs.dct)
-                    else -> Dct.dct2d(buf, base, cw, bwb * 8, bhb * 8, scratch, false)
+                    // HF 係数がすべて 0 の 8x8 は LF の値で埋まる
+                    Tt.DCT8 -> if (nz == 0) Dct.fill8x8(buf, base, cw) else Dct.idct8x8(buf, base, cw, nz, scratch)
+                    // 0 でない係数があるのは上から max(LF の行数, nz) 行だけ
+                    else -> Dct.idct2d(buf, base, cw, bwb * 8, bhb * 8, maxOf(bhb, nz), scratch)
                 }
             }
             // 色平面へ
@@ -950,6 +984,12 @@ internal class FrameDecoder(
             }
         }
     }
+
+    /** X・B の量子化行列の倍率 (Y は 1) */
+    private fun qmScales(): FloatArray = floatArrayOf(
+        Math.pow(0.8, (header.xQmScale - 2).toDouble()).toFloat(), 1f,
+        Math.pow(0.8, (header.bQmScale - 2).toDouble()).toFloat(),
+    )
 
     private inline fun forEachVarblock(c: Int, gbw: Int, gbh: Int, bx0: Int, by0: Int, f: (Int, Int, Int, Int) -> Unit) {
         val hs = hShift[c]
