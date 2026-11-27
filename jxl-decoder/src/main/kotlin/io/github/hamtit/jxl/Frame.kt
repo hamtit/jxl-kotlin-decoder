@@ -90,7 +90,40 @@ internal class HfPass(
     val ordersN: Array<Array<IntArray?>>,
     val ordersT: Array<Array<IntArray?>>,
     val code: EntropyCode,
-)
+) {
+    companion object {
+        private val naturalN = arrayOfNulls<IntArray>(13)
+        private val naturalT = arrayOfNulls<IntArray>(13)
+
+        fun naturalPackedN(o: Int): IntArray {
+            naturalN[o]?.let { return it }
+            val ow = Tt.ORDER_W[o]
+            val owMask = ow - 1
+            val logOw = Integer.numberOfTrailingZeros(ow)
+            val nat = Tt.naturalOrder(o)
+            val packed = IntArray(nat.size) { k ->
+                val p2 = nat[k]
+                ((p2 ushr logOw) shl 16) or (p2 and owMask)
+            }
+            naturalN[o] = packed
+            return packed
+        }
+
+        fun naturalPackedT(o: Int): IntArray {
+            naturalT[o]?.let { return it }
+            val ow = Tt.ORDER_W[o]
+            val owMask = ow - 1
+            val logOw = Integer.numberOfTrailingZeros(ow)
+            val nat = Tt.naturalOrder(o)
+            val packed = IntArray(nat.size) { k ->
+                val p2 = nat[k]
+                ((p2 and owMask) shl 16) or (p2 ushr logOw)
+            }
+            naturalT[o] = packed
+            return packed
+        }
+    }
+}
 
 /** 参照フレーム (パッチ・ブレンドの元) */
 internal class ReferenceFrame(val image: FrameImage)
@@ -758,33 +791,15 @@ internal class FrameDecoder(
                 val ow = Tt.ORDER_W[o]
                 val owMask = ow - 1
                 val logOw = Integer.numberOfTrailingZeros(ow)
-                var natN: IntArray? = null
-                var natT: IntArray? = null
                 for (c in 0 until 3) {
-                    val ord = orders[o][c]
-                    if (ord == null) {
-                        if (natN == null) {
-                            val nat = Tt.naturalOrder(o)
-                            natN = IntArray(nat.size) { k ->
-                                val p2 = nat[k]
-                                ((p2 ushr logOw) shl 16) or (p2 and owMask)
-                            }
-                            natT = IntArray(nat.size) { k ->
-                                val p2 = nat[k]
-                                ((p2 and owMask) shl 16) or (p2 ushr logOw)
-                            }
-                        }
-                        ordersN[o][c] = natN
-                        ordersT[o][c] = natT
-                    } else {
-                        ordersN[o][c] = IntArray(ord.size) { k ->
-                            val p2 = ord[k]
-                            ((p2 ushr logOw) shl 16) or (p2 and owMask)
-                        }
-                        ordersT[o][c] = IntArray(ord.size) { k ->
-                            val p2 = ord[k]
-                            ((p2 and owMask) shl 16) or (p2 ushr logOw)
-                        }
+                    val ord = orders[o][c] ?: continue
+                    ordersN[o][c] = IntArray(ord.size) { k ->
+                        val p2 = ord[k]
+                        ((p2 ushr logOw) shl 16) or (p2 and owMask)
+                    }
+                    ordersT[o][c] = IntArray(ord.size) { k ->
+                        val p2 = ord[k]
+                        ((p2 and owMask) shl 16) or (p2 ushr logOw)
                     }
                 }
             }
@@ -998,7 +1013,11 @@ internal class FrameDecoder(
                     val coeffI = outI?.get(c)
                     val cw = (gbw shr hs) * 8
                     var prevNz = if (nonZeros <= numBlocks * 4) 1 else 0
-                    val order = if (Tt.needTranspose(t)) hfPass.ordersT[orderId][c]!! else hfPass.ordersN[orderId][c]!!
+                    val order = if (Tt.needTranspose(t)) {
+                        hfPass.ordersT[orderId][c] ?: HfPass.naturalPackedT(orderId)
+                    } else {
+                        hfPass.ordersN[orderId][c] ?: HfPass.naturalPackedN(orderId)
+                    }
                     val coeffBase = ctxBase + blockCtx * 458 + 37 * ctx.numClusters
                     val size = order.size
                     val m = qm.get(t, c)
