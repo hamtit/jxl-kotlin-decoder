@@ -1,5 +1,9 @@
 package io.github.hamtit.jxl
 
+import java.lang.invoke.MethodHandles
+import java.lang.invoke.VarHandle
+import java.nio.ByteOrder
+
 /** デコード中に壊れた・対応していないデータを見つけたときの例外 */
 public class JxlException(message: String) : Exception(message)
 
@@ -28,10 +32,15 @@ internal class BitReader(private val data: ByteArray, private val start: Int, pr
             // 次の refill で同じ位置に同じ値を OR するだけなので変わらない
             val d = data
             val p = pos
-            val v = (d[p].toLong() and 0xff) or ((d[p + 1].toLong() and 0xff) shl 8) or
-                ((d[p + 2].toLong() and 0xff) shl 16) or ((d[p + 3].toLong() and 0xff) shl 24) or
-                ((d[p + 4].toLong() and 0xff) shl 32) or ((d[p + 5].toLong() and 0xff) shl 40) or
-                ((d[p + 6].toLong() and 0xff) shl 48) or ((d[p + 7].toLong() and 0xff) shl 56)
+            val vh = LONG_LE
+            val v = if (vh != null) {
+                vh.get(d, p) as Long
+            } else {
+                (d[p].toLong() and 0xff) or ((d[p + 1].toLong() and 0xff) shl 8) or
+                    ((d[p + 2].toLong() and 0xff) shl 16) or ((d[p + 3].toLong() and 0xff) shl 24) or
+                    ((d[p + 4].toLong() and 0xff) shl 32) or ((d[p + 5].toLong() and 0xff) shl 40) or
+                    ((d[p + 6].toLong() and 0xff) shl 48) or ((d[p + 7].toLong() and 0xff) shl 56)
+            }
             buf = buf or (v shl bits)
             pos = p + n
             bits += n shl 3
@@ -83,11 +92,19 @@ internal class BitReader(private val data: ByteArray, private val start: Int, pr
 
     /** 16 ビットを読む (ANS の状態補充の高速版) */
     fun readBits16(): Int {
-        if (bits < 16) return readBits(16)
+        if (bits < 16) refill()
         val v = (buf and 0xffffL).toInt()
         buf = buf ushr 16
         bits -= 16
         return v
+    }
+
+    companion object {
+        private val LONG_LE: VarHandle? = try {
+            MethodHandles.byteArrayViewVarHandle(LongArray::class.java, ByteOrder.LITTLE_ENDIAN)
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     fun readBool(): Boolean = readBits(1) == 1

@@ -297,14 +297,26 @@ internal object Features {
                 val xe = minOf(img.width, Math.floor((px + maxDist + 1.5f).toDouble()).toInt())
                 val yb = maxOf(0, Math.floor((py - maxDist + 0.5f).toDouble()).toInt())
                 val ye = minOf(img.height, Math.floor((py + maxDist + 1.5f).toDouble()).toInt())
-                for (c in 0 until 3) {
-                    val buf = img.color[c]
-                    for (y in yb until ye) for (x in xb until xe) {
+                val buf0 = img.color[0]
+                val buf1 = img.color[1]
+                val buf2 = img.color[2]
+                val v0 = 0.25f * values[0] * sg
+                val v1 = 0.25f * values[1] * sg
+                val v2 = 0.25f * values[2] * sg
+                val w = img.width
+                for (y in yb until ye) {
+                    val dy = y - py
+                    val dy2 = dy * dy
+                    val row = y * w
+                    for (x in xb until xe) {
                         val dx = x - px
-                        val dy = y - py
-                        val d = Math.sqrt((dx * dx + dy * dy).toDouble()).toFloat()
+                        val d = Math.sqrt((dx * dx + dy2).toDouble()).toFloat()
                         val f = erf((0.5f * d + 0.35355338f) * invSigma) - erf((0.5f * d - 0.35355338f) * invSigma)
-                        buf[y * img.width + x] += 0.25f * values[c] * sg * f * f
+                        val f2 = f * f
+                        val idx = row + x
+                        buf0[idx] += v0 * f2
+                        buf1[idx] += v1 * f2
+                        buf2[idx] += v2 * f2
                     }
                 }
             }
@@ -409,78 +421,134 @@ internal object Features {
     fun renderNoise(lut8: FloatArray, img: FrameImage, header: FrameHeader, corrX: Float, corrB: Float, seed0: Long) {
         val w = img.width
         val h = img.height
+        if (w <= 0 || h <= 0) return
         val gd = header.groupDim
-        val raw = Array(3) { FloatArray(w * h) }
         val gpr = (w + gd - 1) / gd
-        val gpc = (h + gd - 1) / gd
-        for (gy in 0 until gpc) for (gx in 0 until gpr) {
-            val x0 = gx * gd
-            val y0 = gy * gd
-            val gw = minOf(gd, w - x0)
-            val gh = minOf(gd, h - y0)
-            val rng = XorShift128Plus(seed0, (x0.toLong() shl 32) + y0)
-            val stride = (gw + 15) / 16 * 16
-            val bits = IntArray(16)
-            for (c in 0 until 3) {
-                val dst = raw[c]
-                val rowBuf = FloatArray(stride)
-                for (y in 0 until gh) {
-                    var k = 0
-                    while (k < stride) {
-                        rng.fill(bits)
-                        for (j in 0 until 16) rowBuf[k + j] = Float.fromBits((bits[j] ushr 9) or 0x3f800000)
-                        k += 16
-                    }
-                    System.arraycopy(rowBuf, 0, dst, (y0 + y) * w + x0, gw)
-                }
-            }
-        }
-        // 5x5 の畳み込み (境界は鏡映)
-        val conv = Array(3) { c ->
-            val src = raw[c]
-            val out = FloatArray(w * h)
-            for (y in 0 until h) for (x in 0 until w) {
-                var sum = 0f
-                for (dy in -2..2) {
-                    val yy = Filters.mirror(y + dy, h)
-                    for (dx in -2..2) sum += src[yy * w + Filters.mirror(x + dx, w)]
-                }
-                out[y * w + x] = sum * 0.16f - src[y * w + x] * 4f
-            }
-            out
-        }
         val lut = FloatArray(9)
         System.arraycopy(lut8, 0, lut, 0, 8)
         lut[8] = lut8[7]
         val px = img.color[0]
         val py = img.color[1]
         val pb = img.color[2]
-        for (i in 0 until w * h) {
-            val gxv = px[i]
-            val gyv = py[i]
-            val inX = gxv + gyv
-            val inY = gyv - gxv
-            val sx3 = maxOf(0f, inX * 3f)
-            val sy3 = maxOf(0f, inY * 3f)
-            val xi = minOf(sx3.toInt(), 7)
-            val xf = sx3 - xi
-            val yi = minOf(sy3.toInt(), 7)
-            val yf = sy3 - yi
-            val sx = (lut[xi + 1] - lut[xi]) * xf + lut[xi]
-            val sy = (lut[yi + 1] - lut[yi]) * yf + lut[yi]
-            val nx = 0.22f * sx * (0.0078125f * conv[0][i] + 0.9921875f * conv[2][i])
-            val ny = 0.22f * sy * (0.0078125f * conv[1][i] + 0.9921875f * conv[2][i])
-            px[i] += corrX * (nx + ny) + nx - ny
-            py[i] += nx + ny
-            pb[i] += corrB * (nx + ny)
+
+        // 5 行の環状バッファ (raw と水平 5 点和を 3 チャンネル分だけ持つ)
+        val raw = Array(3) { Array(5) { FloatArray(w) } }
+        val hsum = Array(3) { Array(5) { FloatArray(w) } }
+        val rngs = Array(3) { arrayOfNulls<XorShift128Plus>(gpr) }
+        val bits = IntArray(16)
+        val maxStride = (minOf(gd, w) + 15) / 16 * 16
+        val rowBuf = FloatArray(maxStride)
+        var generated = 0
+
+        fun generateRow(ry: Int) {
+            if (ry % gd == 0) {
+                val gh = minOf(gd, h - ry)
+                for (gx in 0 until gpr) {
+                    val x0 = gx * gd
+                    val gw = minOf(gd, w - x0)
+                    val stepsPerRow = (gw + 15) / 16
+                    val steps = gh * stepsPerRow
+                    val r0 = XorShift128Plus(seed0, (x0.toLong() shl 32) + ry)
+                    rngs[0][gx] = r0.copy()
+                    r0.skip(steps)
+                    rngs[1][gx] = r0.copy()
+                    r0.skip(steps)
+                    rngs[2][gx] = r0
+                }
+            }
+            val slot = ry % 5
+            for (c in 0 until 3) {
+                val dst = raw[c][slot]
+                val cRngs = rngs[c]
+                for (gx in 0 until gpr) {
+                    val x0 = gx * gd
+                    val gw = minOf(gd, w - x0)
+                    val stride = (gw + 15) / 16 * 16
+                    val rng = cRngs[gx]!!
+                    var k = 0
+                    while (k < stride) {
+                        rng.fill(bits)
+                        for (j in 0 until 16) rowBuf[k + j] = Float.fromBits((bits[j] ushr 9) or 0x3f800000)
+                        k += 16
+                    }
+                    System.arraycopy(rowBuf, 0, dst, x0, gw)
+                }
+                // 水平 5 点和 (境界は鏡映)
+                val hs = hsum[c][slot]
+                if (w >= 5) {
+                    hs[0] = dst[1] + dst[0] + dst[0] + dst[1] + dst[2]
+                    hs[1] = dst[0] + dst[0] + dst[1] + dst[2] + dst[3]
+                    for (x in 2 until w - 2) {
+                        hs[x] = dst[x - 2] + dst[x - 1] + dst[x] + dst[x + 1] + dst[x + 2]
+                    }
+                    hs[w - 2] = dst[w - 4] + dst[w - 3] + dst[w - 2] + dst[w - 1] + dst[w - 1]
+                    hs[w - 1] = dst[w - 3] + dst[w - 2] + dst[w - 1] + dst[w - 1] + dst[w - 2]
+                } else {
+                    for (x in 0 until w) {
+                        var s = 0f
+                        for (dx in -2..2) s += dst[Filters.mirror(x + dx, w)]
+                        hs[x] = s
+                    }
+                }
+            }
+        }
+
+        for (y in 0 until h) {
+            val y0 = Filters.mirror(y - 2, h)
+            val y1 = Filters.mirror(y - 1, h)
+            val y2 = y
+            val y3 = Filters.mirror(y + 1, h)
+            val y4 = Filters.mirror(y + 2, h)
+            val need = maxOf(y0, maxOf(y1, maxOf(y2, maxOf(y3, y4))))
+            while (generated <= need) {
+                generateRow(generated)
+                generated++
+            }
+            val s0 = y0 % 5
+            val s1 = y1 % 5
+            val s2 = y2 % 5
+            val s3 = y3 % 5
+            val s4 = y4 % 5
+            val h00 = hsum[0][s0]; val h01 = hsum[0][s1]; val h02 = hsum[0][s2]; val h03 = hsum[0][s3]; val h04 = hsum[0][s4]
+            val h10 = hsum[1][s0]; val h11 = hsum[1][s1]; val h12 = hsum[1][s2]; val h13 = hsum[1][s3]; val h14 = hsum[1][s4]
+            val h20 = hsum[2][s0]; val h21 = hsum[2][s1]; val h22 = hsum[2][s2]; val h23 = hsum[2][s3]; val h24 = hsum[2][s4]
+            val r0 = raw[0][s2]
+            val r1 = raw[1][s2]
+            val r2 = raw[2][s2]
+            val rowOff = y * w
+            for (x in 0 until w) {
+                val i = rowOff + x
+                val c0 = (h00[x] + h01[x] + h02[x] + h03[x] + h04[x]) * 0.16f - r0[x] * 4f
+                val c1 = (h10[x] + h11[x] + h12[x] + h13[x] + h14[x]) * 0.16f - r1[x] * 4f
+                val c2 = (h20[x] + h21[x] + h22[x] + h23[x] + h24[x]) * 0.16f - r2[x] * 4f
+                val gxv = px[i]
+                val gyv = py[i]
+                val inX = gxv + gyv
+                val inY = gyv - gxv
+                val sx3 = maxOf(0f, inX * 3f)
+                val sy3 = maxOf(0f, inY * 3f)
+                val xi = minOf(sx3.toInt(), 7)
+                val xf = sx3 - xi
+                val yi = minOf(sy3.toInt(), 7)
+                val yf = sy3 - yi
+                val sx = (lut[xi + 1] - lut[xi]) * xf + lut[xi]
+                val sy = (lut[yi + 1] - lut[yi]) * yf + lut[yi]
+                val nx = 0.22f * sx * (0.0078125f * c0 + 0.9921875f * c2)
+                val ny = 0.22f * sy * (0.0078125f * c1 + 0.9921875f * c2)
+                px[i] = gxv + corrX * (nx + ny) + nx - ny
+                py[i] = gyv + nx + ny
+                pb[i] += corrB * (nx + ny)
+            }
         }
     }
 
-    private class XorShift128Plus(seed0: Long, seed1: Long) {
-        private val s0 = LongArray(8)
-        private val s1 = LongArray(8)
+    private class XorShift128Plus {
+        private val s0: LongArray
+        private val s1: LongArray
 
-        init {
+        constructor(seed0: Long, seed1: Long) {
+            s0 = LongArray(8)
+            s1 = LongArray(8)
             s0[0] = splitMix(seed0 + -0x61c8864680b583ebL)
             s1[0] = splitMix(seed1 + -0x61c8864680b583ebL)
             for (i in 1 until 8) {
@@ -489,11 +557,30 @@ internal object Features {
             }
         }
 
+        private constructor(s0: LongArray, s1: LongArray) {
+            this.s0 = s0
+            this.s1 = s1
+        }
+
+        fun copy(): XorShift128Plus = XorShift128Plus(s0.copyOf(), s1.copyOf())
+
         private fun splitMix(zIn: Long): Long {
             var z = zIn
             z = (z xor (z ushr 30)) * -0x40a7b892e31b1a47L
             z = (z xor (z ushr 27)) * -0x6b2fb644ecceee15L
             return z xor (z ushr 31)
+        }
+
+        fun skip(steps: Int) {
+            for (k in 0 until steps) {
+                for (i in 0 until 8) {
+                    var a = s0[i]
+                    val b = s1[i]
+                    s0[i] = b
+                    a = a xor (a shl 23)
+                    s1[i] = a xor (b xor (a ushr 18) xor (b ushr 5))
+                }
+            }
         }
 
         fun fill(out: IntArray) {

@@ -697,32 +697,55 @@ internal class ModularImage(
     }
 
     /** 逆変換して、変換前のチャンネル配置で返す */
-    fun finish(): List<Channel> {
+    fun finish(executor: java.util.concurrent.ExecutorService? = null): List<Channel> {
         val chans = channels
-        for (ti in header.transforms.indices.reversed()) {
-            when (val tr = header.transforms[ti]) {
-                is Transform.Rct -> inverseRct(tr, chans)
-                is Transform.Palette -> inversePalette(tr, chans, bitDepth, header.wp)
-                is Transform.Squeeze -> {
-                    for (si in tr.params.indices.reversed()) {
-                        val sp = tr.params[si]
-                        val begin = sp.beginC
-                        val end = begin + sp.numC
-                        val residuals = ArrayList<Channel>()
-                        if (sp.inPlace) {
-                            for (k in 0 until sp.numC) residuals.add(chans.removeAt(end))
-                        } else {
-                            val start = chans.size - sp.numC
-                            if (start < end) fail("invalid squeeze")
-                            for (k in 0 until sp.numC) residuals.add(chans.removeAt(start))
-                        }
-                        for (k in 0 until sp.numC) {
-                            val merged = if (sp.horizontal) Squeeze.inverseH(chans[begin + k], residuals[k])
-                            else Squeeze.inverseV(chans[begin + k], residuals[k])
-                            chans[begin + k] = merged
+        val pooled = java.util.IdentityHashMap<IntArray, Unit>()
+        try {
+            for (ti in header.transforms.indices.reversed()) {
+                when (val tr = header.transforms[ti]) {
+                    is Transform.Rct -> inverseRct(tr, chans)
+                    is Transform.Palette -> inversePalette(tr, chans, bitDepth, header.wp)
+                    is Transform.Squeeze -> {
+                        for (si in tr.params.indices.reversed()) {
+                            val sp = tr.params[si]
+                            val begin = sp.beginC
+                            val end = begin + sp.numC
+                            val residuals = ArrayList<Channel>(sp.numC)
+                            if (sp.inPlace) {
+                                for (k in 0 until sp.numC) residuals.add(chans.removeAt(end))
+                            } else {
+                                val start = chans.size - sp.numC
+                                if (start < end) fail("invalid squeeze")
+                                for (k in 0 until sp.numC) residuals.add(chans.removeAt(start))
+                            }
+                            val usePool = si > 0
+                            for (k in 0 until sp.numC) {
+                                val avg = chans[begin + k]
+                                val res = residuals[k]
+                                val merged = if (sp.horizontal) Squeeze.inverseH(avg, res, executor, usePool)
+                                else Squeeze.inverseV(avg, res, executor, usePool)
+                                if (pooled.remove(avg.data) != null) ScratchPool.give(avg.data)
+                                if (pooled.remove(res.data) != null) ScratchPool.give(res.data)
+                                if (usePool) pooled[merged.data] = Unit
+                                chans[begin + k] = merged
+                            }
                         }
                     }
                 }
+            }
+        } finally {
+            // 例外時にもプールから借りた中間配列を返す (正常時は最後のステップが usePool=false なので空)
+            for (arr in pooled.keys) {
+                if (chans.none { it.data === arr }) ScratchPool.give(arr)
+            }
+        }
+        // 万が一プール由来の大きすぎる配列が最終チャンネルに残っていれば正確な長さに切り詰める
+        for (c in chans) {
+            val exact = c.width * c.height
+            if (pooled.containsKey(c.data) && c.data.size != exact) {
+                val exactArr = c.data.copyOf(exact)
+                ScratchPool.give(c.data)
+                c.bind(exactArr, 0, c.width)
             }
         }
         if (chans.size != original.size) fail("modular channel count mismatch")
@@ -755,37 +778,78 @@ internal fun inverseRct(tr: Transform.Rct, chans: MutableList<Channel>) {
     val pb = pm[1]
     val type = tr.type % 7
     val w = ca.width
+    val h = ca.height
+    if (type == 6 && pa == 0 && pb == 1) {
+        for (y in 0 until h) {
+            val ia = ca.offset + y * ca.stride
+            val ib = cb.offset + y * cb.stride
+            val ic = cc.offset + y * cc.stride
+            for (x in 0 until w) {
+                val va = a[ia + x]
+                val vb = b[ib + x]
+                val vc = c[ic + x]
+                val tmp = va - (vc shr 1)
+                val e = vc + tmp
+                val f = tmp - (vb shr 1)
+                a[ia + x] = f + vb
+                b[ib + x] = e
+                c[ic + x] = f
+            }
+        }
+        return
+    }
+    val chs = arrayOf(ca, cb, cc)
+    val cD = chs[if (pa == 0) 0 else if (pb == 0) 1 else 2]
+    val cE = chs[if (pa == 1) 0 else if (pb == 1) 1 else 2]
+    val cF = chs[if (pa == 2) 0 else if (pb == 2) 1 else 2]
+    val aD = cD.data
+    val aE = cE.data
+    val aF = cF.data
+    if (type == 6) {
+        for (y in 0 until h) {
+            val ia = ca.offset + y * ca.stride
+            val ib = cb.offset + y * cb.stride
+            val ic = cc.offset + y * cc.stride
+            val iD = cD.offset + y * cD.stride
+            val iE = cE.offset + y * cE.stride
+            val iF = cF.offset + y * cF.stride
+            for (x in 0 until w) {
+                val va = a[ia + x]
+                val vb = b[ib + x]
+                val vc = c[ic + x]
+                val tmp = va - (vc shr 1)
+                val e = vc + tmp
+                val f = tmp - (vb shr 1)
+                aD[iD + x] = f + vb
+                aE[iE + x] = e
+                aF[iF + x] = f
+            }
+        }
+        return
+    }
+    val addF = (type and 1) != 0
+    val modeE = type shr 1
     // チャンネルはグループの矩形 (offset・stride) のこともあるので行ごとに処理する
-    for (y in 0 until ca.height) {
+    for (y in 0 until h) {
         val ia = ca.offset + y * ca.stride
         val ib = cb.offset + y * cb.stride
         val ic = cc.offset + y * cc.stride
+        val iD = cD.offset + y * cD.stride
+        val iE = cE.offset + y * cE.stride
+        val iF = cF.offset + y * cF.stride
         for (x in 0 until w) {
             val va = a[ia + x]
             val vb = b[ib + x]
             val vc = c[ic + x]
-            val d: Int
-            val e: Int
-            val f: Int
-            if (type == 6) {
-                val tmp = va - (vc shr 1)
-                e = vc + tmp
-                f = tmp - (vb shr 1)
-                d = f + vb
-            } else {
-                d = va
-                f = if (type and 1 != 0) vc + va else vc
-                e = when (type shr 1) {
-                    1 -> vb + va
-                    2 -> vb + ((va + f) shr 1)
-                    else -> vb
-                }
+            val f = if (addF) vc + va else vc
+            val e = when (modeE) {
+                1 -> vb + va
+                2 -> vb + ((va + f) shr 1)
+                else -> vb
             }
-            // 並べ替え (pa, pb が決まれば残りは 3 - pa - pb)
-            a[ia + x] = if (pa == 0) d else if (pa == 1) e else f
-            b[ib + x] = if (pb == 0) d else if (pb == 1) e else f
-            val pc = 3 - pa - pb
-            c[ic + x] = if (pc == 0) d else if (pc == 1) e else f
+            aD[iD + x] = va
+            aE[iE + x] = e
+            aF[iF + x] = f
         }
     }
 }
@@ -897,71 +961,106 @@ internal object Squeeze {
         return 0
     }
 
-    fun inverseH(avg: Channel, res: Channel): Channel {
+    fun inverseH(
+        avg: Channel,
+        res: Channel,
+        executor: java.util.concurrent.ExecutorService? = null,
+        usePool: Boolean = false,
+    ): Channel {
         val w = avg.width + res.width
         val h = avg.height
         if (res.height != h || (avg.width != res.width && avg.width != res.width + 1)) fail("invalid squeeze")
         val out = Channel(w, h, avg.hshift, avg.vshift)
-        out.allocate()
+        if (usePool) {
+            val n = w.toLong() * h
+            if (n > Int.MAX_VALUE) fail("channel too large")
+            out.bind(ScratchPool.ints(n.toInt()), 0, w)
+        } else {
+            out.allocate()
+        }
         val aw = avg.width
         val rw = res.width
+        if (aw == 0) return out
         val a = avg.data
         val r = res.data
         val o = out.data
-        for (y in 0 until h) {
-            val ar = y * aw
-            val rr = y * rw
-            val orow = y * w
-            if (aw == 0) continue
-            var av = a[ar]
-            var left = av
-            for (x in 0 until rw) {
-                val next = if (x + 1 < aw) a[ar + x + 1] else av
-                val diff = r[rr + x] + tendency(left, av, next)
-                val first = av + diff / 2
-                val second = first - diff
-                o[orow + 2 * x] = first
-                o[orow + 2 * x + 1] = second
-                av = next
-                left = second
+        parallelRows(executor, h) { y0, y1 ->
+            for (y in y0 until y1) {
+                val ar = y * aw
+                val rr = y * rw
+                val orow = y * w
+                var av = a[ar]
+                var left = av
+                for (x in 0 until rw) {
+                    val next = if (x + 1 < aw) a[ar + x + 1] else av
+                    val diff = r[rr + x] + tendency(left, av, next)
+                    val first = av + diff / 2
+                    val second = first - diff
+                    o[orow + 2 * x] = first
+                    o[orow + 2 * x + 1] = second
+                    av = next
+                    left = second
+                }
+                if (aw > rw) o[orow + w - 1] = a[ar + aw - 1]
             }
-            if (aw > rw) o[orow + w - 1] = a[ar + aw - 1]
         }
         return out
     }
 
-    fun inverseV(avg: Channel, res: Channel): Channel {
+    fun inverseV(
+        avg: Channel,
+        res: Channel,
+        executor: java.util.concurrent.ExecutorService? = null,
+        usePool: Boolean = false,
+    ): Channel {
         val w = avg.width
         val h = avg.height + res.height
         if (res.width != w || (avg.height != res.height && avg.height != res.height + 1)) fail("invalid squeeze")
         val out = Channel(w, h, avg.hshift, avg.vshift)
-        out.allocate()
+        if (usePool) {
+            val n = w.toLong() * h
+            if (n > Int.MAX_VALUE) fail("channel too large")
+            out.bind(ScratchPool.ints(n.toInt()), 0, w)
+        } else {
+            out.allocate()
+        }
         val ah = avg.height
         val rh = res.height
+        if (ah == 0 || w == 0) return out
         val a = avg.data
         val r = res.data
         val o = out.data
-        if (ah == 0) return out
-        // 行単位で処理する
-        val avgRow = IntArray(w)
-        val top = IntArray(w)
-        System.arraycopy(a, 0, avgRow, 0, w)
-        System.arraycopy(a, 0, top, 0, w)
-        for (y in 0 until rh) {
-            val nextBase = if (y + 1 < ah) (y + 1) * w else -1
-            for (x in 0 until w) {
-                val av = avgRow[x]
-                val next = if (nextBase >= 0) a[nextBase + x] else av
-                val diff = r[y * w + x] + tendency(top[x], av, next)
-                val first = av + diff / 2
-                val second = first - diff
-                o[(2 * y) * w + x] = first
-                o[(2 * y + 1) * w + x] = second
-                avgRow[x] = next
-                top[x] = second
+        // 列の帯ごとに独立に縦方向を処理する (帯ごとの作業領域は ScratchPool から借りる)
+        parallelRows(executor, w) { x0, x1 ->
+            val cw = x1 - x0
+            val avgRow = ScratchPool.ints(cw)
+            val top = ScratchPool.ints(cw)
+            try {
+                System.arraycopy(a, x0, avgRow, 0, cw)
+                System.arraycopy(a, x0, top, 0, cw)
+                for (y in 0 until rh) {
+                    val nextBase = if (y + 1 < ah) (y + 1) * w + x0 else -1
+                    val rBase = y * w + x0
+                    val o0 = (2 * y) * w + x0
+                    val o1 = (2 * y + 1) * w + x0
+                    for (k in 0 until cw) {
+                        val av = avgRow[k]
+                        val next = if (nextBase >= 0) a[nextBase + k] else av
+                        val diff = r[rBase + k] + tendency(top[k], av, next)
+                        val first = av + diff / 2
+                        val second = first - diff
+                        o[o0 + k] = first
+                        o[o1 + k] = second
+                        avgRow[k] = next
+                        top[k] = second
+                    }
+                }
+                if (ah > rh) System.arraycopy(a, (ah - 1) * w + x0, o, (h - 1) * w + x0, cw)
+            } finally {
+                ScratchPool.give(avgRow)
+                ScratchPool.give(top)
             }
         }
-        if (ah > rh) System.arraycopy(a, (ah - 1) * w, o, (h - 1) * w, w)
         return out
     }
 }

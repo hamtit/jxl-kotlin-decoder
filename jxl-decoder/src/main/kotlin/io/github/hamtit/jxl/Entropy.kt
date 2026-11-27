@@ -226,6 +226,8 @@ internal class PrefixHistogram private constructor(
     private val toplevel: IntArray,
     private val second: IntArray,
 ) {
+    private val toplevelMask: Int = (1 shl toplevelBits) - 1
+
     // エントリ: bit 31 = nested, bits 16..23 = ビット数 または マスク, bits 0..15 = シンボル または オフセット
     val singleSymbol: Int
         get() = if (toplevel.size == 1 && (toplevel[0] ushr 16) and 0xff == 0 && toplevel[0] >= 0) {
@@ -234,7 +236,7 @@ internal class PrefixHistogram private constructor(
 
     fun readSymbol(br: BitReader): Int {
         val peeked = br.peek(15)
-        val e = toplevel[peeked and ((1 shl toplevelBits) - 1)]
+        val e = toplevel[peeked and toplevelMask]
         if (e < 0) {
             val mask = (e ushr 16) and 0xff
             val off = (e and 0xffff) + ((peeked ushr toplevelBits) and mask)
@@ -664,6 +666,10 @@ internal class EntropyReader(val code: EntropyCode) {
     }
 
     fun finish() {
+        if (window.isNotEmpty()) {
+            ScratchPool.give(window)
+            window = IntArray(0)
+        }
         if (code.usesAns && ansState != 0x130000L) fail("ANS stream checksum mismatch")
     }
 
@@ -709,6 +715,7 @@ internal class EntropyReader(val code: EntropyCode) {
         var next = (state ushr 12) * dist + offset
         if (next < 0x10000) next = (next shl 16) or br.readBits16().toLong()
         ansState = next
+        if (token == 0) return 0
         // hybrid-uint (readUint と同じ)
         val c4 = cluster * 4
         if (token < cfg[c4]) return token
@@ -733,7 +740,12 @@ internal class EntropyReader(val code: EntropyCode) {
         val off = numDecoded and 0xfffff
         if (off >= window.size) {
             val newSize = if (window.isEmpty()) 4096 else minOf(window.size * 2, 1 shl 20)
-            window = window.copyOf(newSize)
+            val next = ScratchPool.ints(newSize)
+            if (window.isNotEmpty()) {
+                System.arraycopy(window, 0, next, 0, window.size)
+                ScratchPool.give(window)
+            }
+            window = next
         }
         window[off] = v
         numDecoded++
