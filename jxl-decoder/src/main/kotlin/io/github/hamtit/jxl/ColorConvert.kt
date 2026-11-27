@@ -89,17 +89,25 @@ internal object ColorConvert {
         }
     }
 
-    fun ycbcrToRgb(img: FrameImage) {
+    fun ycbcrToRgb(img: FrameImage, executor: ExecutorService? = null) {
         val cb = img.color[0]
         val yy = img.color[1]
         val cr = img.color[2]
-        for (i in cb.indices) {
-            val c1 = cb[i]
-            val y = yy[i] + 128f / 255f
-            val c2 = cr[i]
-            cb[i] = c2 * 1.402f + y
-            yy[i] = c1 * (-0.114f * 1.772f / 0.587f) + (c2 * (-0.299f * 1.402f / 0.587f) + y)
-            cr[i] = c1 * 1.772f + y
+        val w = img.width
+        val n = cb.size
+        val kCb = -0.114f * 1.772f / 0.587f
+        val kCr = -0.299f * 1.402f / 0.587f
+        val off = 128f / 255f
+        parallelRows(executor, img.height) { y0, y1 ->
+            val end = minOf(n, y1 * w)
+            for (i in y0 * w until end) {
+                val c1 = cb[i]
+                val y = yy[i] + off
+                val c2 = cr[i]
+                cb[i] = c2 * 1.402f + y
+                yy[i] = c1 * kCb + (c2 * kCr + y)
+                cr[i] = c1 * 1.772f + y
+            }
         }
     }
 
@@ -184,40 +192,97 @@ internal object ColorConvert {
         )
     }
 
+    private const val TF_LUT_SIZE = 4096
+
+    private fun lookupLinear(v: Float, lut: FloatArray, enc: ColourEncoding): Float {
+        if (v >= 0f && v <= 1f) {
+            val s = v * TF_LUT_SIZE
+            val idx = s.toInt()
+            if (idx >= TF_LUT_SIZE) return lut[TF_LUT_SIZE]
+            val f = s - idx
+            return lut[idx] + (lut[idx + 1] - lut[idx]) * f
+        }
+        return toLinear(v, enc)
+    }
+
     /** 列挙型の色空間で表された RGB / グレーを sRGB に変換する (sRGB ならそのまま) */
-    fun toSrgb(img: FrameImage, enc: ColourEncoding) {
+    fun toSrgb(img: FrameImage, enc: ColourEncoding, executor: ExecutorService? = null) {
         if (enc.wantIcc) return
         val needTf = enc.transferFunction != TransferFunction.SRGB
         val needPrim = enc.colourSpace == ColourSpace.RGB && (!enc.isSrgbPrimaries || !enc.isD65)
         if (!needTf && !needPrim) return
-        val matrix: DoubleArray? = if (needPrim) {
+        val isLinear = enc.transferFunction == TransferFunction.LINEAR
+        val w = img.width
+        val n = img.color[0].size
+        if (needPrim && img.color.size == 3) {
             val toXyz = primariesToXyz(enc.primaries, enc.whitePoint)
             val adapt = bradford(enc.whitePoint, ColourEncoding.D65)
             val srgbToXyz = primariesToXyz(ColourEncoding.SRGB_PRIMARIES, ColourEncoding.D65)
-            mul3(invert3(srgbToXyz), mul3(adapt, toXyz))
-        } else null
-        val n = img.color[0].size
-        if (img.color.size == 3) {
+            val md = mul3(invert3(srgbToXyz), mul3(adapt, toXyz))
+            val m = FloatArray(9) { md[it].toFloat() }
+            val m0 = m[0]; val m1 = m[1]; val m2 = m[2]
+            val m3 = m[3]; val m4 = m[4]; val m5 = m[5]
+            val m6 = m[6]; val m7 = m[7]; val m8 = m[8]
             val r = img.color[0]
             val g = img.color[1]
             val b = img.color[2]
-            for (i in 0 until n) {
-                var lr = toLinear(r[i], enc)
-                var lg = toLinear(g[i], enc)
-                var lb = toLinear(b[i], enc)
-                if (matrix != null) {
-                    val nr = (matrix[0] * lr + matrix[1] * lg + matrix[2] * lb).toFloat()
-                    val ng = (matrix[3] * lr + matrix[4] * lg + matrix[5] * lb).toFloat()
-                    val nb = (matrix[6] * lr + matrix[7] * lg + matrix[8] * lb).toFloat()
-                    lr = nr; lg = ng; lb = nb
+            if (isLinear) {
+                parallelRows(executor, img.height) { y0, y1 ->
+                    val end = minOf(n, y1 * w)
+                    for (i in y0 * w until end) {
+                        val lr = r[i]
+                        val lg = g[i]
+                        val lb = b[i]
+                        r[i] = srgbEncodeFast(m0 * lr + m1 * lg + m2 * lb)
+                        g[i] = srgbEncodeFast(m3 * lr + m4 * lg + m5 * lb)
+                        b[i] = srgbEncodeFast(m6 * lr + m7 * lg + m8 * lb)
+                    }
                 }
-                r[i] = srgbEncodeFast(lr)
-                g[i] = srgbEncodeFast(lg)
-                b[i] = srgbEncodeFast(lb)
+            } else {
+                val linLut = FloatArray(TF_LUT_SIZE + 1) { i -> toLinear(i.toFloat() / TF_LUT_SIZE, enc) }
+                parallelRows(executor, img.height) { y0, y1 ->
+                    val end = minOf(n, y1 * w)
+                    for (i in y0 * w until end) {
+                        val lr = lookupLinear(r[i], linLut, enc)
+                        val lg = lookupLinear(g[i], linLut, enc)
+                        val lb = lookupLinear(b[i], linLut, enc)
+                        r[i] = srgbEncodeFast(m0 * lr + m1 * lg + m2 * lb)
+                        g[i] = srgbEncodeFast(m3 * lr + m4 * lg + m5 * lb)
+                        b[i] = srgbEncodeFast(m6 * lr + m7 * lg + m8 * lb)
+                    }
+                }
+            }
+            return
+        }
+        // 原色変換なし: 伝達関数のみ (1 チャンネルまたは 3 チャンネル)
+        if (isLinear) {
+            for (ch in img.color) {
+                parallelRows(executor, img.height) { y0, y1 ->
+                    val end = minOf(n, y1 * w)
+                    for (i in y0 * w until end) ch[i] = srgbEncodeFast(ch[i])
+                }
             }
         } else {
-            val gch = img.color[0]
-            for (i in 0 until n) gch[i] = srgbEncodeFast(toLinear(gch[i], enc))
+            val srgbLut = FloatArray(TF_LUT_SIZE + 1) { i -> srgbEncodeFast(toLinear(i.toFloat() / TF_LUT_SIZE, enc)) }
+            for (ch in img.color) {
+                parallelRows(executor, img.height) { y0, y1 ->
+                    val end = minOf(n, y1 * w)
+                    for (i in y0 * w until end) {
+                        val v = ch[i]
+                        ch[i] = if (v >= 0f && v <= 1f) {
+                            val s = v * TF_LUT_SIZE
+                            val idx = s.toInt()
+                            if (idx >= TF_LUT_SIZE) srgbLut[TF_LUT_SIZE]
+                            else {
+                                val f = s - idx
+                                srgbLut[idx] + (srgbLut[idx + 1] - srgbLut[idx]) * f
+                            }
+                        } else {
+                            srgbEncodeFast(toLinear(v, enc))
+                        }
+                    }
+                }
+            }
         }
     }
 }

@@ -315,9 +315,14 @@ internal object Dct {
             idct8x8(buf, base, stride, rows, scratch)
             return
         }
+        if (rows == 1) {
+            dctInPlace(buf, base, w, scratch, 0, false)
+            for (y in 1 until h) System.arraycopy(buf, base, buf, base + y * stride, w)
+            return
+        }
         for (y in 0 until rows) dctInPlace(buf, base + y * stride, w, scratch, 0, false)
-        // 列方向は、幅 16 以上で高さ 32 以下なら列をまとめて (行どうしの演算で) 変換する
-        if (w >= 16 && h <= 32) {
+        // 列方向は、幅 8 以上で高さ 32 以下なら列をまとめて (行どうしの演算で) 変換する
+        if (w >= 8 && h <= 32) {
             when (h) {
                 8 -> idct8Cols(buf, base, stride, buf, base, stride, w)
                 16 -> {

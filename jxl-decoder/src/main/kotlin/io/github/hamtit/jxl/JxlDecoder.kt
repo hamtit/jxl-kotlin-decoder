@@ -45,7 +45,10 @@ public class JxlFrame internal constructor(
  * スレッドセーフではない。
  */
 public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions = JxlDecodeOptions()) {
-    private val codestream: ByteArray = Container.extractCodestream(data)
+    private val slice: CodestreamSlice = Container.extractCodestream(data)
+    private val codestream: ByteArray = slice.data
+    private val csStart: Int = slice.start
+    private val csEnd: Int = slice.end
     private lateinit var header: ImageHeader
     private var firstFramePos: Int = 0
     private var pos: Int = 0
@@ -77,7 +80,7 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
     }
 
     private fun init0() {
-        val br = BitReader(codestream)
+        val br = BitReader(codestream, csStart, csEnd)
         if (br.readBits(16) != 0x0aff) fail("not a JPEG XL codestream")
         header = ImageHeader.parse(br)
         if (header.width.toLong() * header.height > options.maxPixels) fail("image too large")
@@ -89,7 +92,7 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
             val fh = FrameHeader.parse(br, ph)
             val toc = Toc.parse(br, fh)
             val end = toc.end
-            if (end > codestream.size) fail("truncated preview")
+            if (end > csEnd) fail("truncated preview")
             firstFramePos = end.toInt()
         } else {
             firstFramePos = br.bytePosition()
@@ -138,14 +141,14 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
     }
 
     private fun decodeOneFrame(): JxlFrame? {
-        if (pos >= codestream.size) fail("unexpected end of codestream")
-        val br = BitReader(codestream, pos, codestream.size)
+        if (pos >= csEnd) fail("unexpected end of codestream")
+        val br = BitReader(codestream, pos, csEnd)
         val fh = FrameHeader.parse(br, header)
         // 切り出したフレームは画像と別に大きさを持つので、それも上限を確かめる
         if (fh.width.toLong() * fh.height > minOf(options.maxPixels, Int.MAX_VALUE.toLong())) fail("frame too large")
         val toc = Toc.parse(br, fh)
         val end = toc.end
-        if (end > codestream.size) fail("truncated frame")
+        if (end > csEnd) fail("truncated frame")
         // libjxl と同じく、表示フレームの番号は 1 から、非表示フレームの番号は直前の表示フレームから数える
         val seed = if (fh.isKeyframe) (visibleFrames + 1).toLong() shl 32
         else (visibleFrames.toLong() shl 32) + invisibleSinceVisible + 1
@@ -338,9 +341,9 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         }
         visibleFrames++
         invisibleSinceVisible = 0
-        // 参照と出力は配列を共有しない。向きを反映するときは orient が新しい配列を作る
-        val reorients = options.applyOrientation && header.orientation != 1
-        val pixels = if (keepRef && !reorients) canvas.copyOf() else canvas
+        // 参照と出力は配列を共有しない。orient が新しい配列を作るのは転置 (5..8) のときだけ
+        val allocatesNew = options.applyOrientation && header.orientation >= 5
+        val pixels = if (keepRef && !allocatesNew) canvas.copyOf() else canvas
         return orient(pixels, w, h, frameDuration(fh))
     }
 
@@ -356,15 +359,15 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         if (scanPos < 0) scanPos = firstFramePos
         while (scannedHeaders.size <= j && !scanDone) {
             try {
-                if (scanPos >= codestream.size) {
+                if (scanPos >= csEnd) {
                     scanDone = true
                     break
                 }
-                val br = BitReader(codestream, scanPos, codestream.size)
+                val br = BitReader(codestream, scanPos, csEnd)
                 val fh = FrameHeader.parse(br, header)
                 val toc = Toc.parse(br, fh)
                 val end = toc.end
-                if (end > codestream.size) {
+                if (end > csEnd) {
                     scanDone = true
                     break
                 }
@@ -436,8 +439,8 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
                 if (header.isGrey) img.color = arrayOf(img.color[1])
             }
         } else {
-            if (img.header.doYCbCr) ColorConvert.ycbcrToRgb(img)
-            ColorConvert.toSrgb(img, header.colourEncoding)
+            if (img.header.doYCbCr) ColorConvert.ycbcrToRgb(img, executor)
+            ColorConvert.toSrgb(img, header.colourEncoding, executor)
         }
         img.colorTransformPending = false
     }
@@ -586,23 +589,115 @@ public class JxlDecoder(data: ByteArray, private val options: JxlDecodeOptions =
         val n = w * h
         val o = if (options.applyOrientation) header.orientation else 1
         if (o == 1) return JxlFrame(w, h, pixels, duration)
-        val swap = o >= 5
-        val ow = if (swap) h else w
-        val oh = if (swap) w else h
-        val out = IntArray(n)
-        for (y in 0 until h) for (x in 0 until w) {
-            val (dx, dy) = when (o) {
-                2 -> Pair(w - 1 - x, y)
-                3 -> Pair(w - 1 - x, h - 1 - y)
-                4 -> Pair(x, h - 1 - y)
-                5 -> Pair(y, x)
-                6 -> Pair(h - 1 - y, x)
-                7 -> Pair(h - 1 - y, w - 1 - x)
-                else -> Pair(y, w - 1 - x)
+        when (o) {
+            2 -> {
+                val halfW = w ushr 1
+                parallelRows(executor, h) { y0, y1 ->
+                    for (y in y0 until y1) {
+                        val row = y * w
+                        var l = row
+                        var r = row + w - 1
+                        val end = row + halfW
+                        while (l < end) {
+                            val t = pixels[l]
+                            pixels[l] = pixels[r]
+                            pixels[r] = t
+                            l++
+                            r--
+                        }
+                    }
+                }
+                return JxlFrame(w, h, pixels, duration)
             }
-            out[dy * ow + dx] = pixels[y * w + x]
+            3 -> {
+                var l = 0
+                var r = n - 1
+                while (l < r) {
+                    val t = pixels[l]
+                    pixels[l] = pixels[r]
+                    pixels[r] = t
+                    l++
+                    r--
+                }
+                return JxlFrame(w, h, pixels, duration)
+            }
+            4 -> {
+                val halfH = h ushr 1
+                parallelRows(executor, halfH) { y0, y1 ->
+                    for (y in y0 until y1) {
+                        val r1 = y * w
+                        val r2 = (h - 1 - y) * w
+                        for (x in 0 until w) {
+                            val t = pixels[r1 + x]
+                            pixels[r1 + x] = pixels[r2 + x]
+                            pixels[r2 + x] = t
+                        }
+                    }
+                }
+                return JxlFrame(w, h, pixels, duration)
+            }
+            else -> {
+                val out = IntArray(n)
+                val tileRows = (h + 31) ushr 5
+                when (o) {
+                    5 -> parallelFor(executor, tileRows) { ty ->
+                        val y0 = ty shl 5
+                        val y1 = minOf(h, y0 + 32)
+                        var x0 = 0
+                        while (x0 < w) {
+                            val x1 = minOf(w, x0 + 32)
+                            for (y in y0 until y1) {
+                                val sr = y * w
+                                for (x in x0 until x1) out[x * h + y] = pixels[sr + x]
+                            }
+                            x0 = x1
+                        }
+                    }
+                    6 -> parallelFor(executor, tileRows) { ty ->
+                        val y0 = ty shl 5
+                        val y1 = minOf(h, y0 + 32)
+                        var x0 = 0
+                        while (x0 < w) {
+                            val x1 = minOf(w, x0 + 32)
+                            for (y in y0 until y1) {
+                                val sr = y * w
+                                val dx = h - 1 - y
+                                for (x in x0 until x1) out[x * h + dx] = pixels[sr + x]
+                            }
+                            x0 = x1
+                        }
+                    }
+                    7 -> parallelFor(executor, tileRows) { ty ->
+                        val y0 = ty shl 5
+                        val y1 = minOf(h, y0 + 32)
+                        var x0 = 0
+                        while (x0 < w) {
+                            val x1 = minOf(w, x0 + 32)
+                            for (y in y0 until y1) {
+                                val sr = y * w
+                                val dx = h - 1 - y
+                                for (x in x0 until x1) out[(w - 1 - x) * h + dx] = pixels[sr + x]
+                            }
+                            x0 = x1
+                        }
+                    }
+                    else -> parallelFor(executor, tileRows) { ty ->
+                        val y0 = ty shl 5
+                        val y1 = minOf(h, y0 + 32)
+                        var x0 = 0
+                        while (x0 < w) {
+                            val x1 = minOf(w, x0 + 32)
+                            for (y in y0 until y1) {
+                                val sr = y * w
+                                for (x in x0 until x1) out[(w - 1 - x) * h + y] = pixels[sr + x]
+                            }
+                            x0 = x1
+                        }
+                    }
+                }
+                return JxlFrame(h, w, out, duration)
+            }
         }
-        return JxlFrame(ow, oh, out, duration)
     }
 
     public companion object {
@@ -649,16 +744,19 @@ internal fun ImageHeader.withSize(w: Int, h: Int) = ImageHeader(
     toneMapping, opsinInverseMatrix, opsinBias, quantBias, quantBiasNumerator, up2Weights, up4Weights, up8Weights, 0, 0,
 )
 
+internal class CodestreamSlice(val data: ByteArray, val start: Int, val end: Int)
+
 /** ISOBMFF 形式のコンテナ */
 internal object Container {
     val SIGNATURE = byteArrayOf(0, 0, 0, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87.toByte(), 0x0a)
 
-    fun extractCodestream(data: ByteArray): ByteArray {
-        if (data.size >= 2 && data[0] == 0xff.toByte() && data[1] == 0x0a.toByte()) return data
+    fun extractCodestream(data: ByteArray): CodestreamSlice {
+        if (data.size >= 2 && data[0] == 0xff.toByte() && data[1] == 0x0a.toByte()) return CodestreamSlice(data, 0, data.size)
         if (data.size < 12 || !SIGNATURE.indices.all { data[it] == SIGNATURE[it] }) fail("not a JPEG XL file")
         var p = 0
         val parts = ArrayList<Pair<Int, Int>>()
-        var whole: Pair<Int, Int>? = null
+        var wholeStart = -1
+        var wholeEnd = -1
         while (p + 8 <= data.size) {
             var size = readBe32(data, p).toLong() and 0xffffffffL
             val type = String(data, p + 4, 4, Charsets.ISO_8859_1)
@@ -674,12 +772,12 @@ internal object Container {
             val start = p + header
             val end = (p + size).toInt()
             when (type) {
-                "jxlc" -> whole = Pair(start, end)
+                "jxlc" -> { wholeStart = start; wholeEnd = end }
                 "jxlp" -> if (end - start >= 4) parts.add(Pair(start + 4, end))
             }
             p = end
         }
-        whole?.let { return data.copyOfRange(it.first, it.second) }
+        if (wholeStart >= 0) return CodestreamSlice(data, wholeStart, wholeEnd)
         if (parts.isEmpty()) fail("no codestream in container")
         val total = parts.sumOf { it.second - it.first }
         val out = ByteArray(total)
@@ -688,7 +786,7 @@ internal object Container {
             System.arraycopy(data, s, out, o, e - s)
             o += e - s
         }
-        return out
+        return CodestreamSlice(out, 0, out.size)
     }
 
     private fun readBe32(d: ByteArray, p: Int): Int =

@@ -2,10 +2,18 @@ package io.github.hamtit.jxl.cli
 
 import io.github.hamtit.jxl.JxlDecodeOptions
 import io.github.hamtit.jxl.JxlDecoder
+import io.github.hamtit.jxl.JxlException
 import io.github.hamtit.jxl.JxlFrame
 import java.awt.image.BufferedImage
+import java.awt.image.ColorModel
+import java.awt.image.DataBufferByte
+import java.awt.image.DataBufferInt
+import java.awt.image.DirectColorModel
+import java.awt.image.Raster
 import java.io.File
+import javax.imageio.IIOImage
 import javax.imageio.ImageIO
+import javax.imageio.ImageWriteParam
 import kotlin.system.exitProcess
 
 private fun usage(): Nothing {
@@ -47,10 +55,70 @@ private fun positional(args: List<String>): List<String> {
     return out
 }
 
-private fun toImage(f: JxlFrame): BufferedImage {
-    val img = BufferedImage(f.width, f.height, BufferedImage.TYPE_INT_ARGB)
-    img.setRGB(0, 0, f.width, f.height, f.pixels, 0, f.width)
-    return img
+private fun toImage(f: JxlFrame, hasAlpha: Boolean): BufferedImage {
+    val px = f.pixels
+    var allOpaque = !hasAlpha
+    var allGray = true
+    if (hasAlpha) {
+        allOpaque = true
+        for (p in px) {
+            if ((p ushr 24) != 0xff) {
+                allOpaque = false
+                allGray = false
+                break
+            }
+            val b = p and 0xff
+            if (((p ushr 8) and 0xff) != b || ((p ushr 16) and 0xff) != b) {
+                allGray = false
+            }
+        }
+    } else {
+        for (p in px) {
+            val b = p and 0xff
+            if (((p ushr 8) and 0xff) != b || ((p ushr 16) and 0xff) != b) {
+                allGray = false
+                break
+            }
+        }
+    }
+    if (allOpaque && allGray) {
+        val img = BufferedImage(f.width, f.height, BufferedImage.TYPE_BYTE_GRAY)
+        val dst = (img.raster.dataBuffer as DataBufferByte).data
+        for (i in px.indices) dst[i] = (px[i] and 0xff).toByte()
+        return img
+    }
+    val db = DataBufferInt(px, px.size)
+    if (allOpaque) {
+        val masks = intArrayOf(0x00ff0000, 0x0000ff00, 0x000000ff)
+        val raster = Raster.createPackedRaster(db, f.width, f.height, f.width, masks, null)
+        val cm = DirectColorModel(24, 0x00ff0000, 0x0000ff00, 0x000000ff)
+        return BufferedImage(cm, raster, false, null)
+    }
+    val masks = intArrayOf(0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000.toInt())
+    val raster = Raster.createPackedRaster(db, f.width, f.height, f.width, masks, null)
+    return BufferedImage(ColorModel.getRGBdefault(), raster, false, null)
+}
+
+private fun writePng(img: BufferedImage, file: File) {
+    val writers = ImageIO.getImageWritersByFormatName("png")
+    if (!writers.hasNext()) {
+        ImageIO.write(img, "png", file)
+        return
+    }
+    val writer = writers.next()
+    try {
+        ImageIO.createImageOutputStream(file).use { ios ->
+            writer.output = ios
+            val param = writer.defaultWriteParam
+            if (param.canWriteCompressed()) {
+                param.compressionMode = ImageWriteParam.MODE_EXPLICIT
+                param.compressionQuality = 0.0f
+            }
+            writer.write(null, IIOImage(img, null, null), param)
+        }
+    } finally {
+        writer.dispose()
+    }
 }
 
 public fun main(argv: Array<String>) {
@@ -61,9 +129,10 @@ public fun main(argv: Array<String>) {
         "decode" -> {
             if (pos.size < 2) usage()
             val t0 = System.nanoTime()
-            val frame = JxlDecoder.decode(File(pos[0]).readBytes(), options(args))
+            val dec = JxlDecoder(File(pos[0]).readBytes(), options(args))
+            val frame = dec.nextFrame() ?: throw JxlException("no frames")
             val t1 = System.nanoTime()
-            ImageIO.write(toImage(frame), "png", File(pos[1]))
+            writePng(toImage(frame, dec.info.hasAlpha), File(pos[1]))
             println("${frame.width}x${frame.height} ${"%.1f".format((t1 - t0) / 1e6)} ms")
         }
         "frames" -> {
@@ -73,7 +142,7 @@ public fun main(argv: Array<String>) {
             var i = 0
             while (true) {
                 val f = dec.nextFrame() ?: break
-                ImageIO.write(toImage(f), "png", File(dir, "frame%04d.png".format(i)))
+                writePng(toImage(f, dec.info.hasAlpha), File(dir, "frame%04d.png".format(i)))
                 println("frame $i ${f.width}x${f.height} ${f.durationMillis} ms")
                 i++
             }

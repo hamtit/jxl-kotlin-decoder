@@ -707,30 +707,70 @@ internal object Filters {
     private const val EPF_C0 = 6.6f * (0.70710677f - 1f)
 
     /** 非分離型アップサンプリング (2^shift 倍)。出力は outW x outH に切り詰める */
-    fun upsample(src: Plane, shift: Int, image: ImageHeader, outW: Int, outH: Int): Plane {
+    fun upsample(
+        src: Plane,
+        shift: Int,
+        image: ImageHeader,
+        outW: Int,
+        outH: Int,
+        executor: ExecutorService? = null,
+    ): Plane {
+        val data = upsample(src.data, src.width, src.height, shift, image, outW, outH, executor)
+        if (data === src.data && src.width == outW && src.height == outH) return src
+        return Plane(outW, outH, data)
+    }
+
+    /** 非分離型アップサンプリング (2^shift 倍、FloatArray を直接受け取る)。出力は outW x outH に切り詰める */
+    fun upsample(
+        src: FloatArray,
+        srcW: Int,
+        srcH: Int,
+        shift: Int,
+        image: ImageHeader,
+        outW: Int,
+        outH: Int,
+        executor: ExecutorService? = null,
+    ): FloatArray {
         var cur = src
+        var cw = srcW
+        var ch = srcH
         var s = shift
         while (s >= 3) {
-            cur = upsampleInner(cur, 8, image.up8Weights)
+            cur = upsampleInner(cur, cw, ch, 8, image.up8Weights, executor)
+            cw *= 8
+            ch *= 8
             s -= 3
         }
-        if (s == 1) cur = upsampleInner(cur, 2, image.up2Weights)
-        if (s == 2) cur = upsampleInner(cur, 4, image.up4Weights)
-        if (cur.width == outW && cur.height == outH) return cur
-        val out = Plane(outW, outH)
+        if (s == 1) {
+            cur = upsampleInner(cur, cw, ch, 2, image.up2Weights, executor)
+            cw *= 2
+            ch *= 2
+        } else if (s == 2) {
+            cur = upsampleInner(cur, cw, ch, 4, image.up4Weights, executor)
+            cw *= 4
+            ch *= 4
+        }
+        if (cw == outW && ch == outH) return cur
+        val out = FloatArray(Plane.checkedSize(outW, outH))
+        val copyW = minOf(outW, cw)
         for (y in 0 until outH) {
-            val sy = minOf(y, cur.height - 1)
-            System.arraycopy(cur.data, sy * cur.width, out.data, y * outW, minOf(outW, cur.width))
+            val sy = minOf(y, ch - 1)
+            System.arraycopy(cur, sy * cw, out, y * outW, copyW)
         }
         return out
     }
 
-    private fun upsampleInner(src: Plane, k: Int, weights: FloatArray): Plane {
-        val w = src.width
-        val h = src.height
+    private fun upsampleInner(
+        src: FloatArray,
+        w: Int,
+        h: Int,
+        k: Int,
+        weights: FloatArray,
+        executor: ExecutorService?,
+    ): FloatArray {
         val pad = 2
         val pw = w + 4
-        val p = padded(src.data, w, h, pad)
+        val p = padded(src, w, h, pad)
         val matN = k / 2
         val quarter = Array(matN * matN) { FloatArray(25) }
         var wi = 0
@@ -745,37 +785,54 @@ internal object Filters {
                 quarter[mx * matN + my][kx * 5 + ky] = v
             }
         }
-        val ow = w * k
-        val oh = h * k
-        val out = Plane(ow, oh)
-        val o = out.data
-        for (y in 0 until oh) {
-            val ry = y / k
-            val myy = minOf(y % k, k - y % k - 1)
-            val flipV = y % k >= matN
-            for (x in 0 until ow) {
-                val rx = x / k
-                val mxx = minOf(x % k, k - x % k - 1)
-                val flipH = x % k >= matN
-                val kernel = quarter[myy * matN + mxx]
-                var sum = 0f
-                var mn = Float.POSITIVE_INFINITY
-                var mxv = Float.NEGATIVE_INFINITY
-                for (iy in 0 until 5) {
-                    val kyy = if (flipV) 4 - iy else iy
-                    val row = (ry + iy) * pw + rx
-                    for (ix in 0 until 5) {
-                        val kxx = if (flipH) 4 - ix else ix
-                        val v = p[row + ix]
-                        sum += kernel[kyy * 5 + kxx] * v
-                        if (v < mn) mn = v
-                        if (v > mxv) mxv = v
-                    }
-                }
-                o[y * ow + x] = if (sum < mn) mn else if (sum > mxv) mxv else sum
+        // 反転済みの 25 タップカーネルを k*k 通り事前に作っておく
+        val kernels = Array(k * k) { idx ->
+            val oy = idx / k
+            val ox = idx % k
+            val myy = minOf(oy, k - oy - 1)
+            val mxx = minOf(ox, k - ox - 1)
+            val flipV = oy >= matN
+            val flipH = ox >= matN
+            val q = quarter[myy * matN + mxx]
+            FloatArray(25) { ki ->
+                val iy = ki / 5
+                val ix = ki % 5
+                val kyy = if (flipV) 4 - iy else iy
+                val kxx = if (flipH) 4 - ix else ix
+                q[kyy * 5 + kxx]
             }
         }
-        return out
+        val ow = w * k
+        val oh = h * k
+        val o = FloatArray(Plane.checkedSize(ow, oh))
+        parallelRows(executor, oh) { y0, y1 ->
+            for (y in y0 until y1) {
+                val ry = y / k
+                val oyBase = (y % k) * k
+                val oRow = y * ow
+                val r0 = ry * pw
+                for (x in 0 until ow) {
+                    val rx = x / k
+                    val kernel = kernels[oyBase + (x % k)]
+                    var sum = 0f
+                    var mn = Float.POSITIVE_INFINITY
+                    var mxv = Float.NEGATIVE_INFINITY
+                    var ki = 0
+                    var rb = r0 + rx
+                    for (iy in 0 until 5) {
+                        for (ix in 0 until 5) {
+                            val v = p[rb + ix]
+                            sum += kernel[ki++] * v
+                            if (v < mn) mn = v
+                            if (v > mxv) mxv = v
+                        }
+                        rb += pw
+                    }
+                    o[oRow + x] = if (sum < mn) mn else if (sum > mxv) mxv else sum
+                }
+            }
+        }
+        return o
     }
 
     /** JPEG のクロマアップサンプリング (3:1 の線形補間) */
